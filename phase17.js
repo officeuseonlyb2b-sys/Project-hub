@@ -7,7 +7,7 @@
   let perfFocus=null;
 
   const esc=v=>String(v??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
-  const isAdmin=(id=state.currentUser)=>id===DIRECTOR||user(id).systemRole==='Director / Admin';
+  const isAdmin=(id=state.currentUser)=>id===state.currentUser&&!!window.firebaseHub?.isSystemAdmin();
   const now=()=>new Date();
   const pct=(n,d)=>d?Math.round((n/d)*100):null;
   const pctText=v=>v==null?'—':`${v}%`;

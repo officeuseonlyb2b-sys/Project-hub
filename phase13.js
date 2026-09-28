@@ -4,11 +4,6 @@
   const lifecycleLabels={Planning:'Planning',Active:'Active','On Hold':'On Hold',Terminated:'Terminated',Launched:'Launched',Archived:'Archived'};
   const directorId='u1';
 
-  function protoHash(input){
-    let h=5381;
-    for(let i=0;i<input.length;i++) h=(((h<<5)+h)^input.charCodeAt(i))>>>0;
-    return h.toString(16).padStart(8,'0');
-  }
   function normalizeEmail(v){return String(v||'').trim().toLowerCase()}
   function initials(name){return String(name||'').trim().split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0].toUpperCase()).join('')||'??'}
 
@@ -38,7 +33,7 @@
     save();
   }
 
-  function isDirector(uid=state.currentUser){return uid===directorId||user(uid).systemRole==='Director / Admin'}
+  function isDirector(uid=state.currentUser){return uid===state.currentUser&&!!window.firebaseHub?.isSystemAdmin()}
   function isActiveUser(uid){return user(uid).active!==false}
   function isProjectLead(p,uid=state.currentUser){return !!p&&p.projectLead===uid}
   function canViewProject(p,uid=state.currentUser){return !!p&&isActiveUser(uid)&&(isDirector(uid)||(p.team||[]).includes(uid))}
@@ -154,45 +149,14 @@
     return `<div class="project-admin-actions"><button class="btn btn-ghost" id="manageProjectTeam">Manage Project Team</button>${isDirector()?'<button class="btn btn-ghost" id="changeProjectLead">Change Lead</button>':''}${options.join('')}</div>`
   }
 
-  function openAddMember(existing=null){
-    if(!isDirector())return toast('Only Director / Admin can manage employee login accounts.');
-    const editing=!!existing;
-    openModal(editing?`Manage Account • ${existing.name}`:'Add Team Member',`<form id="memberForm" class="form-stack">
-      <div class="form-grid">${field('Full name',`<input class="input" name="name" required value="${editing?existing.name:''}" placeholder="Employee name">`)}${field('Email / Login ID',`<input class="input" name="email" type="email" required value="${editing?existing.email:''}" placeholder="name@company.com">`)}${field('Designation',`<input class="input" name="role" required value="${editing?existing.role:''}" placeholder="Employee designation">`)}${field('Department',`<input class="input" name="dept" required value="${editing?existing.dept:''}" placeholder="Department">`)}</div>
-      ${field(editing?'New password (optional)':'Initial password',`<input class="input" name="password" type="password" ${editing?'':'required'} minlength="6" autocomplete="new-password" placeholder="${editing?'Leave blank to keep current password':'Set initial login password'}">`,editing?'Existing password is never displayed. Enter a new password only when resetting credentials.':'Employee will use this email and password to sign in.')}
-      <div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft">${editing?'Save Account':'Create Login'}</button></div>
-    </form>`);
-    el('cancelModal').onclick=closeModal;
-    el('memberForm').onsubmit=e=>{
-      e.preventDefault();const fd=new FormData(e.target),email=normalizeEmail(fd.get('email')),duplicate=state.users.find(u=>normalizeEmail(u.email)===email&&(!editing||u.id!==existing.id));if(duplicate)return toast('That login email is already assigned to another employee.');
-      if(editing){const before=`${existing.name} • ${existing.email} • ${existing.role} • ${existing.dept}`;existing.name=fd.get('name').trim();existing.email=email;existing.role=fd.get('role').trim();existing.dept=fd.get('dept').trim();existing.initials=initials(existing.name);if(fd.get('password'))existing.passwordHash=protoHash(fd.get('password'));logAccount(`updated employee account for ${existing.name}`,`${before} → ${existing.name} • ${existing.email} • ${existing.role} • ${existing.dept}${fd.get('password')?' • password reset':''}`)}
-      else{const u={id:'u'+Date.now(),name:fd.get('name').trim(),email,role:fd.get('role').trim(),dept:fd.get('dept').trim(),initials:initials(fd.get('name')),active:true,systemRole:'Team Member',accessRole:'Team Member',passwordHash:protoHash(fd.get('password')),createdAt:new Date().toISOString()};state.users.push(u);logAccount(`created login account for ${u.name}`,`Email: ${u.email} • ${u.role} • ${u.dept}`)}
-      save();closeModal();populateUserSelect();render();toast(editing?'Employee account updated.':'Team member and login created.')
-    };
-  }
+  function openAddMember(){return toast('Manage employee logins from People & Departments.')}
 
   function toggleMember(uid){
     if(!isDirector()||uid===directorId)return;const u=user(uid),next=u.active===false;if(!next){const yes=confirm(`Deactivate ${u.name}'s login? Their projects, tasks, comments and history will remain.`);if(!yes)return}u.active=next;logAccount(`${next?'reactivated':'deactivated'} ${u.name}'s login`,`Account status: ${next?'Active':'Inactive'}`);save();populateUserSelect();render();toast(`${u.name}'s login is now ${next?'active':'inactive'}.`)
   }
 
-  function login(email,password){
-    const u=state.users.find(x=>x.active!==false&&normalizeEmail(x.email)===normalizeEmail(email));if(!u||u.passwordHash!==protoHash(password))return false;state.currentUser=u.id;u.lastLogin=new Date().toISOString();save();sessionStorage.setItem('executionHubSessionFinal',u.id);return true
-  }
-  function showInitialSetup(){
-    let overlay=document.getElementById('loginOverlay');if(!overlay){overlay=document.createElement('div');overlay.id='loginOverlay';overlay.className='login-overlay';document.body.appendChild(overlay)}
-    overlay.innerHTML=`<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">FIRST-TIME SETUP</div><h1>Create the Director / Admin account.</h1><p>This clean build contains no demo users or sample project data. Create the first administrator to begin.</p><form id="setupForm" class="form-stack"><label class="form-field"><span>Full name</span><input class="input" name="name" required autocomplete="name" placeholder="Director / Admin name"></label><label class="form-field"><span>Email / Login ID</span><input class="input" name="email" type="email" required autocomplete="email" placeholder="name@company.com"></label><label class="form-field"><span>Designation</span><input class="input" name="designation" required placeholder="Designation"></label><label class="form-field"><span>Initial department</span><input class="input" name="department" required placeholder="Department name"></label><label class="form-field"><span>Department code</span><input class="input" name="departmentCode" required maxlength="12" placeholder="DEPT"></label><label class="form-field"><span>Password</span><input class="input" name="password" type="password" minlength="8" required autocomplete="new-password" placeholder="Create a secure password"></label><div id="loginError" class="login-error"></div><button class="btn btn-primary login-btn">Create workspace</button></form><div class="security-copy">Prototype note: this local review build stores credentials in browser storage. Production deployment must replace this with server-side authentication and secure password hashing.</div></div>`;
-    overlay.classList.add('open');
-    el('setupForm').onsubmit=e=>{e.preventDefault();const fd=new FormData(e.target),name=String(fd.get('name')||'').trim(),email=normalizeEmail(fd.get('email')),designation=String(fd.get('designation')||'').trim(),deptName=String(fd.get('department')||'').trim(),deptCode=String(fd.get('departmentCode')||'').trim().toUpperCase(),password=String(fd.get('password')||'');if(state.users.some(u=>normalizeEmail(u.email)===email)){el('loginError').textContent='That email is already in use.';return}const d={id:'d1',name:deptName,code:deptCode,headId:'u1',active:true,createdAt:new Date().toISOString(),legacyNames:[]};const u={id:'u1',name,email,designation,role:designation,departmentId:'d1',dept:deptName,reportingTo:null,phone:'',dateJoined:new Date().toISOString().slice(0,10),initials:initials(name),active:true,systemRole:'Director / Admin',accessRole:'Director / Admin',passwordHash:protoHash(password),createdAt:new Date().toISOString(),departmentHistory:[{departmentId:'d1',designation,from:new Date().toISOString().slice(0,10),to:null}]};state.departments=[d];state.users=[u];state.currentUser='u1';save();sessionStorage.setItem('executionHubSessionFinal','u1');overlay.classList.remove('open');populateUserSelect();updateUserBadge();activeView='dashboard';activeProject=null;render();toast('Workspace created. Add departments and employees from People & Departments.');};
-  }
-  function showLogin(){
-    if(!state.users.length){showInitialSetup();return}
-    let overlay=document.getElementById('loginOverlay');if(!overlay){overlay=document.createElement('div');overlay.id='loginOverlay';overlay.className='login-overlay';document.body.appendChild(overlay)}
-    overlay.innerHTML=`<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Welcome back.</h1><p>Use the login credentials created by your Director / Admin.</p><form id="loginForm" class="form-stack"><label class="form-field"><span>Email</span><input class="input" name="email" type="email" autocomplete="username" required placeholder="name@company.com"></label><label class="form-field"><span>Password</span><input class="input" name="password" type="password" autocomplete="current-password" required placeholder="••••••••"></label><div id="loginError" class="login-error"></div><button class="btn btn-primary login-btn">Sign in</button></form><div class="security-copy">Local review build: authentication is simulated in browser storage. Production authentication, sessions and access rules must be enforced on the server/database layer.</div></div>`;
-    overlay.classList.add('open');
-    el('loginForm').onsubmit=e=>{e.preventDefault();const fd=new FormData(e.target);if(!login(fd.get('email'),fd.get('password'))){el('loginError').textContent='Email/password not recognised or account inactive.';return}overlay.classList.remove('open');populateUserSelect();updateUserBadge();activeView='dashboard';activeProject=null;render();toast(`Signed in as ${user(state.currentUser).name}`)};
-  }
-  function logout(){sessionStorage.removeItem('executionHubSessionFinal');closeDrawer();showLogin()}
-  function restoreSession(){const sid=sessionStorage.getItem('executionHubSessionFinal');const u=state.users.find(x=>x.id===sid&&x.active!==false);if(u){state.currentUser=u.id;save();return true}return false}
+  let logout;
+  logout=async function(){closeDrawer();try{await window.firebaseHub?.signOut()}catch(error){console.error('Firebase sign-out failed:',error)}};
 
   const baseUpdateUserBadge=updateUserBadge;
   updateUserBadge=function(){baseUpdateUserBadge();const u=user(state.currentUser);el('currentUserRole').textContent=`${u.role} • ${isDirector()?'Director / Admin':'Team Member'}`;const select=el('userSelect');if(select){select.style.display='none';select.disabled=true;}let lo=el('logoutBtn');if(!lo){lo=document.createElement('button');lo.id='logoutBtn';lo.className='logout-btn';lo.textContent='Log out';document.querySelector('.user-switcher')?.appendChild(lo)}lo.onclick=logout};
@@ -316,8 +280,10 @@
     if(activeProject){const p=project(activeProject);document.querySelectorAll('[data-pulse]').forEach(btn=>btn.onclick=e=>{e.stopPropagation();openProjectPulse(p,btn.dataset.pulse)})}
   };
 
+  window.addEventListener('firebase-save-error',()=>toast('Could not sync to Firebase. Check database rules and your connection.'));
+
   migrate();
   const mb=el('modalBackdrop');if(mb){mb.addEventListener('click',e=>{if(e.target===mb)closeModal()});el('closeModal').onclick=closeModal}
   populateUserSelect();updateUserBadge();
-  if(restoreSession()){render()}else{showLogin()}
+  render();
 })();

@@ -8,7 +8,7 @@
   const uid=()=>state.currentUser;
   const nowIso=()=>new Date().toISOString();
   const activeUsers=()=>state.users.filter(u=>u.active!==false);
-  const isDirector=(id=uid())=>id===directorId||user(id).systemRole==='Director / Admin';
+  const isDirector=(id=uid())=>id===uid()&&!!window.firebaseHub?.isSystemAdmin();
   const fullProjectAccess=(p,id=uid())=>!!p&&user(id).active!==false&&(isDirector(id)||(p.team||[]).includes(id));
   const projectLead=(p,id=uid())=>!!p&&p.projectLead===id;
   const wsOwner=(p,ws)=>(p?.workstreams||[]).find(w=>w.name===ws)?.owner;

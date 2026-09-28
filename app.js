@@ -14,7 +14,15 @@ const seed = {
   performanceSnapshots: []
 };
 
-let state = JSON.parse(localStorage.getItem('executionHubStateFinal') || 'null') || structuredClone(seed);
+function normalizeState(data){
+  const normalized = { ...structuredClone(seed), ...(data || {}) };
+  Object.keys(seed).forEach(key => {
+    if (Array.isArray(seed[key]) && !Array.isArray(normalized[key])) normalized[key] = [];
+    if (seed[key] && typeof seed[key] === 'object' && !Array.isArray(seed[key]) && (!normalized[key] || typeof normalized[key] !== 'object')) normalized[key] = {};
+  });
+  return normalized;
+}
+let state = normalizeState(window.firebaseHub?.initialState);
 let activeView = 'dashboard';
 let activeProject = null;
 let activeProjectTab = 'overview';
@@ -24,7 +32,34 @@ const el = id => document.getElementById(id);
 const user = id => state.users.find(u=>u.id===id) || {name:id,initials:'?',role:''};
 const project = id => state.projects.find(p=>p.id===id);
 const task = id => state.tasks.find(t=>t.id===id);
-const save = () => localStorage.setItem('executionHubStateFinal', JSON.stringify(state));
+const save = () => {
+  state.users.forEach(account => {
+    delete account.passwordHash;
+    delete account.password;
+  });
+  return window.firebaseHub?.saveState(state);
+};
+window.applyFirebaseState = data => {
+  const currentUser = state.currentUser;
+  state = normalizeState({ ...(data || {}), currentUser });
+  state.users.forEach(account => { delete account.passwordHash; delete account.password; });
+};
+window.refreshFirebaseView = () => {
+  const authUser = window.firebaseHub?.authUser;
+  const profile = state.users.find(account => account.authUid === authUser?.uid || account.email?.toLowerCase() === authUser?.email?.toLowerCase());
+  if (!profile || profile.active === false) {
+    state.currentUser = null;
+    if (typeof showLogin === 'function') showLogin();
+    return;
+  }
+  state.currentUser = profile.id;
+  activeView = 'dashboard';
+  activeProject = null;
+  activeProjectTab = 'overview';
+  populateUserSelect();
+  updateUserBadge();
+  render();
+};
 const fmtDate = d => new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
 const fmtDateFull = d => new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
 const fmtTime = d => new Date(d).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});

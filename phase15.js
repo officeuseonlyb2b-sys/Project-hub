@@ -7,7 +7,7 @@
   let plannerScope='mine';
 
   function uid(){return state.currentUser}
-  function isDirector(id=uid()){return id===DIRECTOR || user(id).systemRole==='Director / Admin'}
+  function isDirector(id=uid()){return id===uid() && !!window.firebaseHub?.isSystemAdmin()}
   function visibleProject(p,id=uid()){return !!p && user(id).active!==false && (isDirector(id)||(p.team||[]).includes(id))}
   function isProjectLead(p,id=uid()){return !!p && p.projectLead===id}
   function canScheduleProjectMeeting(p,id=uid()){return visibleProject(p,id)&&(isDirector(id)||isProjectLead(p,id))}

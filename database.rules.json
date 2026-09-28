@@ -1,0 +1,23 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "executionHub": {
+      "workspaces": {
+        "default": {
+          "state": {
+            ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+            ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+          }
+        }
+      },
+      "users": {
+        "$uid": {
+          ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || auth.uid === $uid)",
+          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+          ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('createdBy').val() === 'ashish@arpitatravels.com')"
+        }
+      }
+    }
+  }
+}
