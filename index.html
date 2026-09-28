@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Execution Hub</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">EH</div>
+        <div>
+          <div class="brand-name">Execution Hub</div>
+          <div class="brand-sub">Projects • Launches • Accountability</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-view="dashboard"><span>⌂</span> Command Centre</button>
+        <button class="nav-item" data-view="projects"><span>▦</span> Projects</button>
+        <button class="nav-item" data-view="mywork"><span>✓</span> My Work</button>
+        <button class="nav-item" data-view="planner"><span>▣</span> Planner</button>
+        <button class="nav-item" data-view="approvals"><span>◎</span> Approvals</button>
+        <button class="nav-item" data-view="team"><span>◉</span> People &amp; Departments</button>
+        <button class="nav-item" data-view="activity"><span>↺</span> Activity</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="security-note">
+          <div class="security-dot"></div>
+          <div>
+            <strong>Audit trail active</strong>
+            <span>Every important change is recorded.</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow" id="pageEyebrow">MANAGEMENT</div>
+          <h1 id="pageTitle">Command Centre</h1>
+        </div>
+        <div class="topbar-actions">
+          <div class="search-wrap"><span>⌕</span><input id="globalSearch" type="text" placeholder="Search projects, tasks, people…" /></div>
+          <button class="icon-btn" id="notificationBtn" title="Notifications">◌<span class="notify-dot" id="notificationDot"></span></button>
+          <div class="user-switcher">
+            <div class="avatar" id="currentAvatar">?</div>
+            <div class="user-meta"><strong id="currentUserName">Not signed in</strong><span id="currentUserRole">Private workspace</span></div>
+            <select id="userSelect" aria-label="Current account"></select>
+          </div>
+        </div>
+      </header>
+
+      <section class="content" id="content"></section>
+    </main>
+  </div>
+
+  <div class="drawer-backdrop" id="drawerBackdrop"></div>
+  <aside class="drawer" id="taskDrawer">
+    <div class="drawer-head">
+      <div>
+        <div class="eyebrow" id="drawerEyebrow">TASK</div>
+        <h2 id="drawerTitle">Task title</h2>
+      </div>
+      <button class="icon-btn" id="closeDrawer">✕</button>
+    </div>
+    <div id="drawerBody"></div>
+  </aside>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head"><div><div class="eyebrow">EXECUTION HUB</div><h2 id="modalTitle">Modal</h2></div><button class="icon-btn" id="closeModal">✕</button></div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <script src="phase13.js"></script>
+  <script src="phase15.js"></script>
+  <script src="phase16.js"></script>
+  <script src="phase17.js"></script>
+  <script src="phase18.js"></script>
+</body>
+</html>
