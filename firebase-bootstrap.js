@@ -12,7 +12,6 @@ import {
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import { get, getDatabase, onValue, ref, set } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
-import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-functions.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
 const AUTH_LOADING = 'AUTH_LOADING';
@@ -34,7 +33,6 @@ const employeeProfilesPath = 'executionHub/users';
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const database = getDatabase(app);
-const functions = getFunctions(app, 'asia-southeast1');
 const employeeCreationApp = initializeApp(firebaseConfig, 'employeeCreation');
 const employeeCreationAuth = getAuth(employeeCreationApp);
 let authUser = null;
@@ -189,8 +187,9 @@ async function authorize(user) {
       state = legacyState;
       legacyState = null;
     }
+  } else {
+    state = await readWorkspace();
   }
-  else state = (await httpsCallable(functions, 'loadWorkspace')()).data;
   state = { ...emptyState(), ...(state || {}) };
   if (admin) {
     state = ensureAdminProfile(state, user);
@@ -367,17 +366,18 @@ function startRealtimeSync() {
       if (polling || !authUser) return;
       polling = true;
       try {
-        const incoming = (await httpsCallable(functions, 'loadWorkspace')()).data;
-        incoming.users = Array.isArray(incoming.users) ? incoming.users : [];
-        const existing = incoming.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
+            const incoming = await readWorkspace();
+        const workspace = incoming || emptyState();
+        workspace.users = Array.isArray(workspace.users) ? workspace.users : [];
+        const existing = workspace.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
         const appProfile = { ...(existing || {}), ...appUserFromEmployee(employeeProfile) };
-        if (!existing) incoming.users.push(appProfile);
-        else incoming.users[incoming.users.indexOf(existing)] = appProfile;
-        const json = JSON.stringify(cleanState(incoming));
+        if (!existing) workspace.users.push(appProfile);
+        else workspace.users[workspace.users.indexOf(existing)] = appProfile;
+        const json = JSON.stringify(cleanState(workspace));
         if (json !== lastStateJson) {
           lastStateJson = json;
-          window.firebaseHub.initialState = incoming;
-          window.applyFirebaseState(incoming);
+          window.firebaseHub.initialState = workspace;
+          window.applyFirebaseState(workspace);
           window.refreshFirebaseView();
         }
       } catch (error) {
@@ -434,7 +434,7 @@ window.firebaseHub = {
       credential = await createUserWithEmailAndPassword(employeeCreationAuth, email, password);
       const uid = credential.user.uid;
       const savedProfile = { ...profile, uid, email: credential.user.email, role: 'employee' };
-      await httpsCallable(functions, 'createEmployeeProfile')({ uid, profile: savedProfile });
+      await set(ref(database, `${employeeProfilesPath}/${uid}`), savedProfile);
       await signOut(employeeCreationAuth);
       return { ...credential.user, uid };
     } catch (error) {
@@ -446,14 +446,14 @@ window.firebaseHub = {
   async saveEmployeeProfile(uid, profile) {
     if (!isSystemAdmin()) throw new Error('Only the system administrator may update employee profiles.');
     if (!uid || uid === auth.currentUser?.uid || profile.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()) throw new Error('The System Admin account cannot be edited as an employee.');
-    await httpsCallable(functions, 'saveEmployeeProfile')({ uid, profile: { ...profile, uid, role: 'employee' } });
+    await set(ref(database, `${employeeProfilesPath}/${uid}`), { ...profile, uid, role: 'employee' });
   },
   async updateEmployeeStatus(uid, status) {
     if (!isSystemAdmin()) throw new Error('Only the system administrator may update employee status.');
     if (!uid || uid === auth.currentUser?.uid) throw new Error('The System Admin account cannot be deactivated.');
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${uid}`));
     if (!snapshot.exists()) throw new Error('The Firebase employee profile was not found.');
-    await httpsCallable(functions, 'saveEmployeeProfile')({ uid, profile: { ...snapshot.val(), status, uid, role: 'employee' } });
+    await set(ref(database, `${employeeProfilesPath}/${uid}`), { ...snapshot.val(), status, uid, role: 'employee' });
   },
   async resetPassword(email) { return sendPasswordResetEmail(auth, email); },
   async signOut() {
@@ -469,12 +469,8 @@ window.firebaseHub = {
     const json = JSON.stringify(cleaned);
     if (json === lastStateJson) return;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
-      if (isSystemAdmin()) {
-        await set(ref(database, workspacePath), cleaned);
-        lastStateJson = json;
-      } else {
-        await httpsCallable(functions, 'saveWorkspace')({ state: cleaned });
-      }
+      await set(ref(database, workspacePath), cleaned);
+      lastStateJson = json;
     });
     try {
       await saveQueue;

@@ -6,16 +6,16 @@
       "workspaces": {
         "default": {
           "state": {
-            ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
-            ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+            ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || root.child('executionHub/users').child(auth.uid).child('status').val() === 'active')",
+            ".write": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (root.child('executionHub/users').child(auth.uid).child('status').val() === 'active' && root.child('executionHub/users').child(auth.uid).child('uid').val() === auth.uid))"
           }
         }
       },
       "users": {
         "$uid": {
           ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || auth.uid === $uid)",
-          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
-          ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('createdBy').val() === 'ashish@arpitatravels.com')"
+          ".write": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (auth.uid === $uid && newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val() === 'active'))",
+          ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val() !== 'admin' && newData.child('status').val() !== 'director' && newData.child('email').val() !== 'ashish@arpitatravels.com')"
         }
       }
     }
