@@ -15,6 +15,9 @@ import { get, getDatabase, onValue, ref, set } from 'https://www.gstatic.com/fir
 import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-functions.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
+const AUTH_LOADING = 'AUTH_LOADING';
+const AUTHENTICATED = 'AUTHENTICATED';
+const SIGNED_OUT = 'SIGNED_OUT';
 const firebaseConfig = {
   apiKey: 'AIzaSyC0gOy_JIaIpds2BdoHGv20EZiuHt8ozvM',
   authDomain: 'project-hub-emp.firebaseapp.com',
@@ -45,6 +48,34 @@ let authFlow = Promise.resolve();
 let handlingUid = null;
 let pendingAuthMessage = '';
 let legacyState = null;
+let firebaseAuthState = AUTH_LOADING;
+
+function setFirebaseAuthState(nextState) {
+  firebaseAuthState = nextState;
+  const appShell = document.querySelector('.app-shell');
+  const overlay = document.getElementById('firebaseAuthOverlay');
+  if (nextState === AUTH_LOADING) {
+    appShell?.classList.add('firebase-app-hidden');
+    if (!overlay) {
+      const loadingOverlay = document.createElement('div');
+      loadingOverlay.id = 'firebaseAuthOverlay';
+      loadingOverlay.className = 'login-overlay open';
+      loadingOverlay.innerHTML = '<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Loading your workspace...</h1><p>Please wait while your secure session is restored.</p></div>';
+      document.body.appendChild(loadingOverlay);
+    } else {
+      overlay.innerHTML = '<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Loading your workspace...</h1><p>Please wait while your secure session is restored.</p></div>';
+      overlay.classList.add('open');
+    }
+    return;
+  }
+  if (nextState === AUTHENTICATED) {
+    appShell?.classList.remove('firebase-app-hidden');
+    overlay?.classList.remove('open');
+    return;
+  }
+  appShell?.classList.add('firebase-app-hidden');
+  overlay?.classList.remove('open');
+}
 
 function isSystemAdmin(user = auth.currentUser) {
   return user?.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase();
@@ -275,6 +306,7 @@ async function handleAuthState(user) {
     stopWatching = null;
     if (stopProfileWatch) stopProfileWatch();
     stopProfileWatch = null;
+    firebaseAuthState = SIGNED_OUT;
     showLogin(pendingAuthMessage);
     pendingAuthMessage = '';
     return;
@@ -284,22 +316,27 @@ async function handleAuthState(user) {
   handlingUid = user.uid;
   authFlow = (async () => {
     try {
-      await authorize(user);
+      setFirebaseAuthState(AUTH_LOADING);
+      const restored = await authorize(user);
+      authUser = user;
+      employeeProfile = restored?.profile || employeeProfile;
       await loadApplication();
       if (appLoaded) {
         window.applyFirebaseState(window.firebaseHub.initialState);
         window.refreshFirebaseView();
       }
+      setFirebaseAuthState(AUTHENTICATED);
       setApplicationVisible(true);
       startRealtimeSync();
+      firebaseAuthState = AUTHENTICATED;
     } catch (error) {
       console.error('Firebase authorization failed:', error);
       const message = error?.message || friendlyAuthError(error);
-      await signOut(auth).catch(() => {});
       authUser = null;
       employeeProfile = null;
       handlingUid = null;
       pendingAuthMessage = message;
+      firebaseAuthState = SIGNED_OUT;
       showLogin(message);
       return { error: message };
     }
@@ -318,7 +355,8 @@ function startRealtimeSync() {
         pendingAuthMessage = disabled
           ? ({ inactive: 'Your account is inactive. Please contact the administrator.', resigned: 'Your account is marked as resigned. Please contact the administrator.', suspended: 'Your account is suspended. Please contact the administrator.' }[profile.status] || 'Your account is disabled. Please contact the administrator.')
           : 'Your account is not authorized for this application. Please contact the administrator.';
-        signOut(auth).catch(() => {});
+        firebaseAuthState = SIGNED_OUT;
+        showLogin(pendingAuthMessage);
         return;
       }
       employeeProfile = profile;
@@ -344,9 +382,11 @@ function startRealtimeSync() {
         }
       } catch (error) {
         console.error('Could not refresh employee workspace:', error);
-        if (error.code === 'functions/permission-denied') {
-          pendingAuthMessage = error.message;
-          await signOut(auth).catch(() => {});
+        const code = error?.code || error?.message || '';
+        if (code.includes('permission-denied') || code.includes('unauthenticated')) {
+          pendingAuthMessage = error.message || 'Your account is not authorized for this application. Please contact the administrator.';
+          firebaseAuthState = SIGNED_OUT;
+          showLogin(pendingAuthMessage);
         }
       } finally { polling = false; }
     };
@@ -443,7 +483,13 @@ window.firebaseHub = {
       window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
     }
   },
-  startRealtimeSync
+  startRealtimeSync,
+  get authState() {
+    return firebaseAuthState;
+  },
+  AUTH_LOADING,
+  AUTHENTICATED,
+  SIGNED_OUT
 };
 
 function startupError(error) {
@@ -461,6 +507,7 @@ try {
   }
   localStorage.removeItem('executionHubStateFinal');
   sessionStorage.removeItem('executionHubSessionFinal');
+  setFirebaseAuthState(AUTH_LOADING);
   await setPersistence(auth, browserLocalPersistence);
   await setPersistence(employeeCreationAuth, inMemoryPersistence);
   let firstAuthState = true;
