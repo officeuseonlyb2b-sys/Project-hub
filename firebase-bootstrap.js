@@ -11,7 +11,7 @@ import {
   signInWithEmailAndPassword,
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
-import { get, getDatabase, onValue, ref, set } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
+import { get, getDatabase, onValue, ref, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
 const AUTH_LOADING = 'AUTH_LOADING';
@@ -30,6 +30,9 @@ const firebaseConfig = {
 
 const workspacePath = 'executionHub/workspaces/default/state';
 const employeeProfilesPath = 'executionHub/users';
+const privateDataPath = 'executionHub/admin/private';
+const workspaceCollections = ['users', 'departments', 'projects', 'tasks', 'approvals', 'approvalHistory', 'comments', 'activity', 'calendarEvents'];
+const privateCollections = ['performanceReviews', 'performanceSnapshots'];
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const database = getDatabase(app);
@@ -39,9 +42,16 @@ let authUser = null;
 let employeeProfile = null;
 let stopWatching = null;
 let stopProfileWatch = null;
+let stopPrivateWatching = null;
 let appLoaded = false;
 let lastStateJson = null;
+let lastPrivateJson = null;
+let lastPrivateData = { performanceReviews: [], performanceSnapshots: [] };
+let privateDataAvailable = false;
+let legacyPrivateDataPending = false;
 let saveQueue = Promise.resolve();
+let workspaceRecordKeys = Object.fromEntries(workspaceCollections.map(key => [key, new Map()]));
+let privateRecordKeys = Object.fromEntries(privateCollections.map(key => [key, new Map()]));
 let authFlow = Promise.resolve();
 let handlingUid = null;
 let pendingAuthMessage = '';
@@ -89,6 +99,8 @@ function emptyState() {
 function cleanState(value) {
   const result = JSON.parse(JSON.stringify(value || emptyState()));
   delete result.currentUser;
+  delete result.performanceReviews;
+  delete result.performanceSnapshots;
   result.users = (result.users || []).filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase());
   result.users.forEach(account => {
     delete account.passwordHash;
@@ -96,6 +108,60 @@ function cleanState(value) {
     delete account.temporaryPassword;
   });
   return result;
+}
+
+function recordsFrom(value) {
+  if (Array.isArray(value)) return value.filter(record => record && typeof record === 'object');
+  if (value && typeof value === 'object') return Object.values(value).filter(record => record && typeof record === 'object');
+  return [];
+}
+
+function recordIdentity(record, index) {
+  return String(record?.id ?? `legacy-${index}`);
+}
+
+function databaseRecordKey(id) {
+  return encodeURIComponent(String(id)).replace(/\./g, '%2E');
+}
+
+function privateCollectionsSnapshot(value) {
+  return Object.fromEntries(privateCollections.map(collection => [collection, recordsFrom(value?.[collection])]));
+}
+
+function clonePrivateCollections(value) {
+  return Object.fromEntries(privateCollections.map(collection => [
+    collection,
+    recordsFrom(value?.[collection]).map(record => JSON.parse(JSON.stringify(record)))
+  ]));
+}
+
+function captureRecordKeys(source, collections, target) {
+  for (const collection of collections) {
+    const value = source?.[collection];
+    const entries = Array.isArray(value)
+      ? value.map((record, index) => [String(index), record])
+      : Object.entries(value || {});
+    target[collection] = new Map(entries
+      .filter(([, record]) => record && typeof record === 'object')
+      .map(([key, record], index) => [recordIdentity(record, index), key]));
+  }
+}
+
+function normalizeWorkspace(value) {
+  const workspace = { ...emptyState(), ...(value || {}) };
+  [...workspaceCollections, ...privateCollections].forEach(key => {
+    workspace[key] = recordsFrom(workspace[key]);
+  });
+  return workspace;
+}
+
+function mergeRecordsById(primary, legacy) {
+  const merged = new Map(recordsFrom(primary).map((record, index) => [recordIdentity(record, index), record]));
+  recordsFrom(legacy).forEach((record, index) => {
+    const id = recordIdentity(record, index);
+    if (!merged.has(id)) merged.set(id, record);
+  });
+  return [...merged.values()];
 }
 
 function stripLegacyCredentials(value) {
@@ -112,7 +178,49 @@ function containsLegacyCredentials(value) {
 
 async function readWorkspace() {
   const snapshot = await get(ref(database, workspacePath));
-  return snapshot.exists() ? snapshot.val() : null;
+  const value = snapshot.exists() ? snapshot.val() : null;
+  captureRecordKeys(value, workspaceCollections, workspaceRecordKeys);
+  return normalizeWorkspace(value);
+}
+
+async function loadPrivateAdminData(state) {
+  const snapshot = await get(ref(database, privateDataPath));
+  const stored = snapshot.exists() ? snapshot.val() : {};
+  const migration = {};
+  const privateData = { ...stored };
+
+  privateCollections.forEach(collection => {
+    const legacy = state[collection];
+    const storedCollection = stored[collection] || {};
+    const collectionData = Array.isArray(storedCollection)
+      ? Object.fromEntries(storedCollection.map((record, index) => [String(index), record]))
+      : { ...storedCollection };
+    const storedIds = new Set(recordsFrom(storedCollection).map(recordIdentity));
+    const merged = mergeRecordsById(storedCollection, legacy);
+
+    if (recordsFrom(legacy).length) {
+      recordsFrom(legacy).forEach((record, index) => {
+        const id = recordIdentity(record, index);
+        if (storedIds.has(id)) return;
+        const key = databaseRecordKey(id);
+        migration[`${privateDataPath}/${collection}/${key}`] = record;
+        collectionData[key] = record;
+        storedIds.add(id);
+      });
+      migration[`${workspacePath}/${collection}`] = null;
+    }
+
+    privateData[collection] = collectionData;
+    state[collection] = merged;
+  });
+
+  if (Object.keys(migration).length) await update(ref(database), migration);
+  captureRecordKeys(privateData, privateCollections, privateRecordKeys);
+  lastPrivateData = clonePrivateCollections(privateData);
+  lastPrivateJson = JSON.stringify(lastPrivateData);
+  privateCollections.forEach(collection => { state[collection] = [...lastPrivateData[collection]]; });
+  privateDataAvailable = true;
+  legacyPrivateDataPending = false;
 }
 
 function appUserFromEmployee(profile) {
@@ -192,8 +300,21 @@ async function authorize(user) {
   }
   state = { ...emptyState(), ...(state || {}) };
   if (admin) {
+    try {
+      await loadPrivateAdminData(state);
+    } catch (error) {
+      if (!isDatabasePermissionDenied(error)) throw error;
+      legacyPrivateDataPending = privateCollections.some(collection => recordsFrom(state[collection]).length > 0);
+      privateDataAvailable = false;
+      lastPrivateData = { performanceReviews: [], performanceSnapshots: [] };
+      lastPrivateJson = JSON.stringify(lastPrivateData);
+      privateCollections.forEach(collection => { state[collection] = []; });
+      console.warn('Private management data is unavailable until Realtime Database rules grant System Admin access.');
+    }
+  } else privateCollections.forEach(collection => { state[collection] = []; });
+  if (admin) {
     state = ensureAdminProfile(state, user);
-    if (scrubCloudCredentials) await set(ref(database, workspacePath), cleanState(state));
+    if (scrubCloudCredentials && !legacyPrivateDataPending) await set(ref(database, workspacePath), cleanState(state));
   } else {
     state.users = Array.isArray(state.users) ? state.users : [];
     const existing = state.users.find(account => account.authUid === user.uid || account.id === profile.appUserId);
@@ -233,6 +354,12 @@ function friendlyAuthError(error) {
   if (code === 'functions/unavailable' || code === 'functions/internal') return 'The secure application service is unavailable. Please contact the administrator.';
   if (code === 'PERMISSION_DENIED' || error?.message?.includes('PERMISSION_DENIED')) return 'Firebase denied access. Check the deployed Realtime Database rules.';
   return error?.message || 'Unable to complete the Firebase request. Please try again.';
+}
+
+function isDatabasePermissionDenied(error) {
+  return error?.code === 'PERMISSION_DENIED'
+    || error?.code === 'database/permission-denied'
+    || /permission denied/i.test(error?.message || '');
 }
 
 function showLogin(message = '') {
@@ -305,6 +432,8 @@ async function handleAuthState(user) {
     stopWatching = null;
     if (stopProfileWatch) stopProfileWatch();
     stopProfileWatch = null;
+    if (stopPrivateWatching) stopPrivateWatching();
+    stopPrivateWatching = null;
     firebaseAuthState = SIGNED_OUT;
     showLogin(pendingAuthMessage);
     pendingAuthMessage = '';
@@ -397,8 +526,12 @@ function startRealtimeSync() {
   stopWatching = onValue(ref(database, workspacePath), snapshot => {
     if (!snapshot.exists()) return;
     const incoming = snapshot.val();
-    if (isSystemAdmin()) ensureAdminProfile(incoming, authUser);
+    if (isSystemAdmin()) {
+      ensureAdminProfile(incoming, authUser);
+      Object.assign(incoming, clonePrivateCollections(lastPrivateData));
+    }
     else if (employeeProfile) {
+      privateCollections.forEach(collection => { incoming[collection] = []; });
       incoming.users = Array.isArray(incoming.users) ? incoming.users : [];
       const existing = incoming.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
       const appProfile = { ...(existing || {}), ...appUserFromEmployee(employeeProfile) };
@@ -417,6 +550,30 @@ function startRealtimeSync() {
     console.error('Firebase live sync failed:', error);
     window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
   });
+  if (isSystemAdmin()) startPrivateAdminSync();
+}
+
+function startPrivateAdminSync() {
+  if (stopPrivateWatching || !isSystemAdmin() || !privateDataAvailable) return;
+  stopPrivateWatching = onValue(ref(database, privateDataPath), snapshot => {
+    const stored = snapshot.exists() ? snapshot.val() : {};
+    const next = privateCollectionsSnapshot(stored);
+    const json = JSON.stringify(next);
+    if (json === lastPrivateJson) return;
+    lastPrivateJson = json;
+    lastPrivateData = clonePrivateCollections(next);
+    privateDataAvailable = true;
+    captureRecordKeys(stored, privateCollections, privateRecordKeys);
+    const combined = { ...(window.firebaseHub.initialState || emptyState()), ...lastPrivateData };
+    window.firebaseHub.initialState = combined;
+    if (typeof window.applyFirebaseState === 'function') {
+      window.applyFirebaseState(combined);
+      window.refreshFirebaseView();
+    }
+  }, error => {
+    console.error('Could not monitor private administrator data:', error);
+    window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
+  });
 }
 
 window.firebaseHub = {
@@ -426,6 +583,7 @@ window.firebaseHub = {
   employeeProfile: null,
   get authUser() { return authUser; },
   get SYSTEM_ADMIN_EMAIL() { return SYSTEM_ADMIN_EMAIL; },
+  get privateDataAvailable() { return privateDataAvailable; },
   isSystemAdmin,
   friendlyError: friendlyAuthError,
   async createEmployeeAccount(email, password, profile) {
@@ -461,16 +619,56 @@ window.firebaseHub = {
     stopWatching = null;
     if (stopProfileWatch) stopProfileWatch();
     stopProfileWatch = null;
+    if (stopPrivateWatching) stopPrivateWatching();
+    stopPrivateWatching = null;
     await signOut(auth);
   },
   async saveState(state) {
     if (!auth.currentUser) return;
+    if (isSystemAdmin() && !privateDataAvailable && legacyPrivateDataPending) {
+      console.warn('Workspace save skipped to preserve legacy private management data until Admin database rules are available.');
+      return;
+    }
     const cleaned = cleanState(state);
     const json = JSON.stringify(cleaned);
-    if (json === lastStateJson) return;
+    const privateSnapshot = clonePrivateCollections(state);
+    const privateJson = JSON.stringify(privateSnapshot);
+    const admin = isSystemAdmin();
+    if (json === lastStateJson && (!admin || privateJson === lastPrivateJson)) return;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
-      await set(ref(database, workspacePath), cleaned);
-      lastStateJson = json;
+      if (json !== lastStateJson) {
+        await set(ref(database, workspacePath), cleaned);
+        lastStateJson = json;
+      }
+      if (admin && privateDataAvailable && privateJson !== lastPrivateJson) {
+        const updates = {};
+        privateCollections.forEach(collection => {
+          const previous = new Map(lastPrivateData[collection].map((record, index) => [recordIdentity(record, index), record]));
+          const next = new Map(privateSnapshot[collection].map((record, index) => [recordIdentity(record, index), record]));
+          previous.forEach((record, id) => {
+            if (!next.has(id)) {
+              const key = privateRecordKeys[collection].get(id) || databaseRecordKey(id);
+              updates[`${privateDataPath}/${collection}/${key}`] = null;
+            }
+          });
+          next.forEach((record, id) => {
+            if (JSON.stringify(previous.get(id)) === JSON.stringify(record)) return;
+            const key = privateRecordKeys[collection].get(id) || databaseRecordKey(id);
+            updates[`${privateDataPath}/${collection}/${key}`] = record;
+          });
+        });
+        if (Object.keys(updates).length) await update(ref(database), updates);
+        lastPrivateData = clonePrivateCollections(privateSnapshot);
+        lastPrivateJson = privateJson;
+        privateCollections.forEach(collection => {
+          const nextKeys = new Map();
+          privateSnapshot[collection].forEach((record, index) => {
+            const id = recordIdentity(record, index);
+            nextKeys.set(id, privateRecordKeys[collection].get(id) || databaseRecordKey(id));
+          });
+          privateRecordKeys[collection] = nextKeys;
+        });
+      }
     });
     try {
       await saveQueue;

@@ -24,10 +24,12 @@
       if(!Array.isArray(p.team)||!p.team.length)p.team=[p.projectLead].filter(Boolean);
       if(state.users.some(u=>u.id===directorId)&&!p.team.includes(directorId))p.team.unshift(directorId);
       if(p.projectLead&&!p.team.includes(p.projectLead))p.team.push(p.projectLead);
-      p.workstreams=(p.workstreams||[]).map(w=>typeof w==='string'?{name:w,progress:0,owner:p.projectLead}:{...w,owner:w.owner||p.projectLead});
-      [...new Set(state.tasks.filter(t=>t.project===p.id).map(t=>t.workstream).filter(Boolean))].forEach(name=>{
-        if(!p.workstreams.some(w=>w.name===name))p.workstreams.push({name,progress:0,owner:p.projectLead});
-      });
+      if(Object.hasOwn(p,'workstreams')&&Array.isArray(p.workstreams)){
+        p.workstreams=projectWorkstreams(p).map(w=>typeof w==='string'?{name:w,progress:0,owner:p.projectLead}:{...w,owner:w.owner||p.projectLead});
+        [...new Set(state.tasks.filter(t=>t.project===p.id).map(t=>t.workstream).filter(Boolean))].forEach(name=>{
+          if(!projectWorkstreams(p).some(w=>w.name===name))p.workstreams.push({name,progress:0,owner:p.projectLead});
+        });
+      }
     });
     state.schemaVersion=PHASE;
     save();
@@ -40,9 +42,9 @@
   function canManageProject(p,uid=state.currentUser){return !!p&&canViewProject(p,uid)&&(isDirector(uid)||isProjectLead(p,uid))}
   function visibleProjects(uid=state.currentUser){return state.projects.filter(p=>canViewProject(p,uid))}
   function projectTasks(p){return state.tasks.filter(t=>t.project===p.id)}
-  function wsOwner(p,ws){return (p.workstreams||[]).find(w=>w.name===ws)?.owner}
+  function wsOwner(p,ws){return projectWorkstreams(p).find(w=>w.name===ws)?.owner}
   function isCategoryOwner(p,ws,uid=state.currentUser){return wsOwner(p,ws)===uid}
-  function canCreateTask(p,ws,uid=state.currentUser){return canViewProject(p,uid) && (!!ws && (p.workstreams||[]).some(w=>w.name===ws))}
+  function canCreateTask(p,ws,uid=state.currentUser){return canViewProject(p,uid) && (!!ws && projectWorkstreams(p).some(w=>w.name===ws))}
   function canAssignTaskToOthers(p,ws,uid=state.currentUser){return canManageProject(p,uid)||isCategoryOwner(p,ws,uid)}
   function canEditTask(t,uid=state.currentUser){const p=project(t.project);return !!p&&canViewProject(p,uid)&&(isDirector(uid)||isProjectLead(p,uid)||isCategoryOwner(p,t.workstream,uid)||t.owner===uid)}
   function canCommentTask(t,uid=state.currentUser){const p=project(t.project);return !!p&&canViewProject(p,uid)}
@@ -59,7 +61,7 @@
     return {big:Math.abs(d),small:'days past launch target'};
   }
   function calcProjectProgress(p){const ts=projectTasks(p);return ts.length?Math.round(ts.reduce((s,t)=>s+(Number(t.progress)||0),0)/ts.length):(Number(p.progress)||0)}
-  function calcWsProgress(p,name){const ts=projectTasks(p).filter(t=>t.workstream===name),stored=(p.workstreams||[]).find(w=>w.name===name)?.progress||0;return ts.length?Math.round(ts.reduce((s,t)=>s+(Number(t.progress)||0),0)/ts.length):stored}
+  function calcWsProgress(p,name){const ts=projectTasks(p).filter(t=>t.workstream===name),stored=projectWorkstreams(p).find(w=>w.name===name)?.progress||0;return ts.length?Math.round(ts.reduce((s,t)=>s+(Number(t.progress)||0),0)/ts.length):stored}
   function accountBadge(u){return `<span class="access-badge ${u.active===false?'inactive':'team-member'}">${u.active===false?'Inactive':u.systemRole}</span>`}
   function projectRoleBadge(p,uid){if(isProjectLead(p,uid))return '<span class="project-role-badge lead">Project Lead</span>';if(isDirector(uid))return '<span class="project-role-badge director">Director Oversight</span>';return '<span class="project-role-badge">Project Member</span>'}
 
@@ -115,7 +117,7 @@
     if(!canManageProject(p))return toast('Only Director or Project Lead can add project categories.');
     openModal(`Add Category • ${p.name}`,`<form id="addWsForm" class="form-stack"><div class="form-grid">${field('Category / workstream','<input class="input" name="name" required placeholder="Category name">')}${field('Category owner',`<select class="select" name="owner">${(p.team||[]).filter(isActiveUser).map(uid=>`<option value="${uid}">${user(uid).name}</option>`).join('')}</select>`,'Category owner can assign and manage tasks within this category.')}</div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft">Add Category</button></div></form>`);
     el('cancelModal').onclick=closeModal;
-    el('addWsForm').onsubmit=e=>{e.preventDefault();const fd=new FormData(e.target),name=fd.get('name').trim();if(p.workstreams.some(w=>w.name.toLowerCase()===name.toLowerCase()))return toast('That category already exists.');p.workstreams.push({name,progress:0,owner:fd.get('owner')});log(state.currentUser,p.id,null,'Category',`created category ${name}`,`Owner: ${user(fd.get('owner')).name}`);save();closeModal();activeProjectTab='workstreams';render();toast('Category created and ownership recorded.')};
+    el('addWsForm').onsubmit=e=>{e.preventDefault();const fd=new FormData(e.target),name=fd.get('name').trim(),workstreams=projectWorkstreams(p);if(workstreams.some(w=>w.name.toLowerCase()===name.toLowerCase()))return toast('That category already exists.');p.workstreams=workstreams;p.workstreams.push({name,progress:0,owner:fd.get('owner')});log(state.currentUser,p.id,null,'Category',`created category ${name}`,`Owner: ${user(fd.get('owner')).name}`);save();closeModal();activeProjectTab='workstreams';render();toast('Category created and ownership recorded.')};
   }
 
   function openAssignCategory(p,ws){
@@ -127,7 +129,7 @@
 
   function openNewTask(p,preWs=''){
     if(!canViewProject(p))return toast('You do not have access to this project.');
-    const allowed=(p.workstreams||[]).filter(w=>canCreateTask(p,w.name));if(!allowed.length)return toast('This project has no categories yet.');
+    const allowed=projectWorkstreams(p).filter(w=>canCreateTask(p,w.name));if(!allowed.length)return toast('This project has no categories yet.');
     const current=allowed.some(w=>w.name===preWs)?preWs:allowed[0].name;
     const canAssign=canAssignTaskToOthers(p,current);
     const ownerField=canAssign?`<select class="select" name="owner">${(p.team||[]).filter(isActiveUser).map(uid=>`<option value="${uid}" ${uid===state.currentUser?'selected':''}>${user(uid).name}</option>`).join('')}</select>`:`<input type="hidden" name="owner" value="${state.currentUser}"><div class="locked-field">${user(state.currentUser).name}<small>Team members may create tasks for themselves. Project Lead/category owner can assign work to others.</small></div>`;

@@ -17,6 +17,12 @@
           ".write": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (auth.uid === $uid && newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val() === 'active'))",
           ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val() !== 'admin' && newData.child('status').val() !== 'director' && newData.child('email').val() !== 'ashish@arpitatravels.com')"
         }
+      },
+      "admin": {
+        "private": {
+          ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+        }
       }
     }
   }

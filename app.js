@@ -14,12 +14,24 @@ const seed = {
   performanceSnapshots: []
 };
 
+const projectWorkstreams = project => Array.isArray(project?.workstreams) ? project.workstreams : [];
+function withSafeProjectWorkstreams(project){
+  if(!project || typeof project !== 'object') return project;
+  return new Proxy(project,{
+    get(target,property,receiver){
+      if(property==='workstreams') return projectWorkstreams(target);
+      return Reflect.get(target,property,receiver);
+    }
+  });
+}
+
 function normalizeState(data){
   const normalized = { ...structuredClone(seed), ...(data || {}) };
   Object.keys(seed).forEach(key => {
     if (Array.isArray(seed[key]) && !Array.isArray(normalized[key])) normalized[key] = [];
     if (seed[key] && typeof seed[key] === 'object' && !Array.isArray(seed[key]) && (!normalized[key] || typeof normalized[key] !== 'object')) normalized[key] = {};
   });
+  normalized.projects = normalized.projects.map(withSafeProjectWorkstreams);
   return normalized;
 }
 let state = normalizeState(window.firebaseHub?.initialState);
@@ -53,9 +65,6 @@ window.refreshFirebaseView = () => {
     return;
   }
   state.currentUser = profile.id;
-  activeView = 'dashboard';
-  activeProject = null;
-  activeProjectTab = 'overview';
   populateUserSelect();
   updateUserBadge();
   render();
@@ -174,7 +183,7 @@ function renderProjects(search=''){
       <div class="topline"><div><div class="eyebrow">${p.category.toUpperCase()} • ${p.code}</div><h3 style="margin-top:6px">${p.name}</h3></div><span class="status-pill ${p.health}">${healthLabel(p.health)}</span></div>
       <p>${p.description}</p>
       <div class="progress-wrap"><div class="progress"><span style="width:${p.progress}%"></span></div><div class="percent">${p.progress}%</div></div>
-      <div class="workstreams">${p.workstreams.slice(0,4).map(w=>`<div class="workstream-row"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div>
+      <div class="workstreams">${projectWorkstreams(p).slice(0,4).map(w=>`<div class="workstream-row"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div>
       <div style="display:flex;justify-content:space-between;margin-top:15px"><span class="subtle">Launch ${fmtDateFull(p.launch)}</span><button class="link-btn">Open project →</button></div>
     </div>`).join('')}</div>`;
 }
@@ -214,7 +223,7 @@ function renderProjectOverview(p,tasks){
   const critical=tasks.filter(t=>t.priority==='P0'&&t.status!=='Completed').sort((a,b)=>a.currentDue.localeCompare(b.currentDue));
   return `
     <div class="grid-2">
-      <div class="panel"><div class="panel-head"><div><h3>Workstreams</h3><span>Launch readiness by area</span></div><button class="link-btn" data-project-tab="workstreams">View details →</button></div><div class="panel-body"><div class="workstreams">${p.workstreams.map(w=>`<div class="workstream-row" style="grid-template-columns:1fr 180px 40px"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div></div></div>
+      <div class="panel"><div class="panel-head"><div><h3>Workstreams</h3><span>Launch readiness by area</span></div><button class="link-btn" data-project-tab="workstreams">View details →</button></div><div class="panel-body"><div class="workstreams">${projectWorkstreams(p).map(w=>`<div class="workstream-row" style="grid-template-columns:1fr 180px 40px"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div></div></div>
       <div class="panel"><div class="panel-head"><div><h3>Project pulse</h3><span>Current risk indicators</span></div></div><div class="panel-body"><div class="attention-list"><div class="attention-item"><strong>${overdue} overdue task${overdue===1?'':'s'}</strong><span>Original commitments remain visible.</span></div><div class="attention-item"><strong>${ready} item${ready===1?'':'s'} awaiting review</strong><span>Ready for manager approval.</span></div><div class="attention-item"><strong>${tasks.filter(t=>t.waitingOn).length} dependencies</strong><span>Waiting-on ownership is recorded.</span></div></div></div></div>
     </div>
     <div class="section-row"><div><h2>Critical & launch-sensitive work</h2><p>P0 tasks that can directly affect delivery.</p></div><button class="link-btn" data-project-tab="tasks">See all tasks →</button></div>
@@ -225,7 +234,7 @@ function renderProjectOverview(p,tasks){
 
 function renderProjectWorkstreams(p,tasks){
   return `<div class="section-row" style="margin-top:0"><div><h2>Workstream readiness</h2><p>See progress, workload and risk area by area.</p></div></div>
-    <div class="workstream-grid">${p.workstreams.map(w=>{
+    <div class="workstream-grid">${projectWorkstreams(p).map(w=>{
       const wt=tasks.filter(t=>t.workstream===w.name);
       const open=wt.filter(t=>t.status!=='Completed').length;
       const over=wt.filter(isOverdue).length;
