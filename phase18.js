@@ -110,6 +110,7 @@
     const editing=!!existing,selectedDepartment=editing?existing.departmentId:presetDepartmentId;
     openOrgModal(editing?`Manage Employee • ${existing.name}`:'Add Employee & Login',`<form id="employeeForm" class="form-stack">
       <div class="form-grid">${field('Full Name',`<input class="input" name="name" required value="${editing?esc(existing.name):''}" placeholder="Employee name">`)}${field('Email',`<input class="input" type="email" name="email" required value="${editing?esc(existing.email):''}" ${(editing&&existing.authUid)?'readonly':''} placeholder="name@company.com">`)}${field('Mobile',`<input class="input" name="mobile" value="${editing?esc(existing.mobile||existing.phone||''):''}" placeholder="Mobile number">`)}${field('Employee ID',`<input class="input" name="employeeId" required value="${editing?esc(existing.employeeId||''):''}" placeholder="EMP001">`)}${field('Department',`<select class="select" name="department" required>${departmentOptions(selectedDepartment,editing&&deptById(selectedDepartment)?.active===false)}</select>`)}${field('Designation',`<input class="input" name="designation" required value="${editing?esc(existing.designation||existing.role):''}" placeholder="Employee designation">`)}${field('Role',`<input class="input" name="jobRole" required value="${editing?esc(existing.jobRole||'Team Member'):'Team Member'}" placeholder="Job role">`,'This is an employee role label. System Admin identity is fixed; project permissions remain assigned within each project.')}${field('Reports to',`<select class="select" name="reportingTo">${reportingOptions(editing?existing.reportingTo||'':DIRECTOR,editing?existing.id:'')}</select>`)}${field('Joining Date',`<input class="input" type="date" name="dateJoined" value="${editing?esc(existing.dateJoined||''):''}">`)}${field('Status',`<select class="select" name="status">${['active','inactive','resigned','suspended'].map(status=>`<option value="${status}" ${(editing?(existing.status|| (existing.active===false?'inactive':'active')):'active')===status?'selected':''}>${status[0].toUpperCase()+status.slice(1)}</option>`).join('')}</select>`)}${(!editing||!existing.authUid)?field('Temporary Password','<input class="input" type="password" name="password" required minlength="6" autocomplete="new-password" placeholder="Set temporary password">'):''}</div>
+      ${!editing?'<div class="form-help">The initial password is used only to create the Firebase login; it is not saved or viewable later. If it is forgotten, send a password-reset email from the employee card.</div>':''}
       ${editing&&existing.authUid?'<div class="form-help">Login email is managed by Firebase Authentication and cannot be changed from this profile editor. Use the password-reset action to let the employee choose a new password.</div>':editing?'<div class="form-help">This legacy employee has no Firebase login yet. Set a temporary password to create and securely link an account while retaining their existing work history.</div>':''}
       <div class="form-help prominent">Department defines the employee's organisational home and Department Performance. Project access remains separate and is granted only when the employee is selected into a project.</div>
       <div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelOrgModal">Cancel</button>${editing&&existing.authUid?'<button type="button" class="btn btn-ghost" id="employeePasswordReset">Send Password Reset</button>':''}<button class="btn btn-soft" type="submit">${editing&&!existing.authUid?'Create Login & Save Employee':editing?'Save Employee':'Create Employee & Login'}</button></div>
@@ -140,6 +141,18 @@
         }catch(error){submit.disabled=false;toast(window.firebaseHub.friendlyError(error));return}
       }
       save();closeOrgModal();populateUserSelect();render();toast(editing?'Employee updated.':'Employee and login created.')
+    }
+  }
+
+  async function sendEmployeePasswordReset(uid){
+    if(!isAdmin())return toast('Only Director / Admin can send employee password resets.');
+    const employee=safeUser(uid);
+    if(!employee.authUid||!employee.email)return toast('This employee does not have a Firebase login yet.');
+    try{
+      await window.firebaseHub.resetPassword(employee.email);
+      toast(`Password reset email sent to ${employee.email}.`);
+    }catch(error){
+      toast(window.firebaseHub.friendlyError(error));
     }
   }
 
@@ -216,6 +229,14 @@
     document.querySelectorAll('.open-department').forEach(b=>b.onclick=e=>{e.stopPropagation();orgFocusDept=b.dataset.dept;render()});
     document.querySelectorAll('.manage-department').forEach(b=>b.onclick=e=>{e.stopPropagation();openDepartment(deptById(b.dataset.dept))});
     document.querySelectorAll('.org-edit-employee').forEach(b=>b.onclick=()=>openEmployee(safeUser(b.dataset.user)));
+    document.querySelectorAll('.org-edit-employee').forEach(edit=>{
+      const employee=safeUser(edit.dataset.user),actions=edit.parentElement;
+      if(!employee.authUid||!actions||actions.querySelector('.org-reset-employee'))return;
+      const reset=document.createElement('button');
+      reset.type='button';reset.className='btn btn-ghost org-reset-employee';reset.textContent='Reset Password';reset.dataset.user=employee.id;
+      actions.insertBefore(reset,edit.nextSibling);
+    });
+    document.querySelectorAll('.org-reset-employee').forEach(b=>b.onclick=()=>sendEmployeePasswordReset(b.dataset.user));
     document.querySelectorAll('.org-toggle-employee').forEach(b=>b.onclick=()=>toggleEmployee(b.dataset.user));
     document.querySelectorAll('.org-performance').forEach(b=>b.onclick=()=>{activeView='performance';activeProject=null;render();setTimeout(()=>{const open=el('openIndividualsFromCompany');if(open)open.click();setTimeout(()=>{const btn=document.querySelector(`[data-perf-user="${b.dataset.user}"]`);if(btn)btn.click()},0)},0)});
     const back=el('backDepartments');if(back)back.onclick=()=>{orgFocusDept=null;orgTab='departments';render()};
