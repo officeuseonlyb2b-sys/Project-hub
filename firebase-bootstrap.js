@@ -21,7 +21,6 @@ const firebaseConfig = {
   apiKey: 'AIzaSyC0gOy_JIaIpds2BdoHGv20EZiuHt8ozvM',
   authDomain: 'project-hub-emp.firebaseapp.com',
   databaseURL: 'https://project-hub-emp-default-rtdb.asia-southeast1.firebasedatabase.app',
-        const incoming = await readEmployeeWorkspace(employeeProfile);
   storageBucket: 'project-hub-emp.firebasestorage.app',
   messagingSenderId: '360406593945',
   appId: '1:360406593945:web:3ca19e86849053b4f76308',
