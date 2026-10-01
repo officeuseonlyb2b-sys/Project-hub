@@ -12,6 +12,7 @@ import {
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import { get, getDatabase, onValue, ref, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
+import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-functions.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
 const AUTH_LOADING = 'AUTH_LOADING';
@@ -30,16 +31,22 @@ const firebaseConfig = {
 
 const workspacePath = 'executionHub/workspaces/default/state';
 const employeeProfilesPath = 'executionHub/users';
+const adminAuthorizationPath = 'executionHub/admin/authorization';
 const privateDataPath = 'executionHub/admin/private';
 const workspaceCollections = ['users', 'departments', 'projects', 'tasks', 'approvals', 'approvalHistory', 'comments', 'activity', 'calendarEvents'];
 const privateCollections = ['performanceReviews', 'performanceSnapshots'];
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const database = getDatabase(app);
+const functions = getFunctions(app, 'asia-southeast1');
+const authorizeSystemAdmin = httpsCallable(functions, 'authorizeSystemAdmin');
+const loadEmployeeWorkspace = httpsCallable(functions, 'loadWorkspace');
+const saveEmployeeWorkspace = httpsCallable(functions, 'saveWorkspace');
 const employeeCreationApp = initializeApp(firebaseConfig, 'employeeCreation');
 const employeeCreationAuth = getAuth(employeeCreationApp);
 let authUser = null;
 let employeeProfile = null;
+let systemAdminUid = null;
 let stopWatching = null;
 let stopProfileWatch = null;
 let stopPrivateWatching = null;
@@ -86,7 +93,7 @@ function setFirebaseAuthState(nextState) {
 }
 
 function isSystemAdmin(user = auth.currentUser) {
-  return user?.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase();
+  return !!user?.uid && user.uid === systemAdminUid;
 }
 
 function emptyState() {
@@ -265,6 +272,17 @@ function ensureAdminProfile(state, user) {
 
 async function authorize(user) {
   if (!user?.email) throw new Error('Your Firebase account does not have an email address.');
+  systemAdminUid = null;
+  if (user.email.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()) {
+    const result = (await authorizeSystemAdmin()).data;
+    if (result?.admin === true && result.uid === user.uid) {
+      const snapshot = await get(ref(database, `${adminAuthorizationPath}/${user.uid}`));
+      const authorization = snapshot.exists() ? snapshot.val() : null;
+      if (authorization?.uid === user.uid && authorization.role === 'system_admin' && authorization.status === 'active') {
+        systemAdminUid = user.uid;
+      }
+    }
+  }
   const admin = isSystemAdmin(user);
   let profile = null;
   if (!admin) {
@@ -296,7 +314,7 @@ async function authorize(user) {
       legacyState = null;
     }
   } else {
-    state = await readWorkspace();
+    state = (await loadEmployeeWorkspace()).data || emptyState();
   }
   state = { ...emptyState(), ...(state || {}) };
   if (admin) {
@@ -381,8 +399,7 @@ function showLogin(message = '') {
     button.disabled = true;
     document.getElementById('firebaseAuthMessage').textContent = '';
     try {
-      const credential = await signInWithEmailAndPassword(auth, String(values.get('email')).trim(), String(values.get('password')));
-      await handleAuthState(credential.user);
+      await signInWithEmailAndPassword(auth, String(values.get('email')).trim(), String(values.get('password')));
     } catch (error) {
       document.getElementById('firebaseAuthMessage').textContent = friendlyAuthError(error);
       button.disabled = false;
@@ -427,6 +444,7 @@ async function handleAuthState(user) {
   if (!user) {
     authUser = null;
     employeeProfile = null;
+    systemAdminUid = null;
     handlingUid = null;
     if (stopWatching) stopWatching();
     stopWatching = null;
@@ -462,8 +480,10 @@ async function handleAuthState(user) {
       const message = error?.message || friendlyAuthError(error);
       authUser = null;
       employeeProfile = null;
+      systemAdminUid = null;
       handlingUid = null;
       pendingAuthMessage = message;
+      await signOut(auth).catch(() => {});
       firebaseAuthState = SIGNED_OUT;
       showLogin(message);
       return { error: message };
@@ -495,7 +515,7 @@ function startRealtimeSync() {
       if (polling || !authUser) return;
       polling = true;
       try {
-            const incoming = await readWorkspace();
+        const incoming = (await loadEmployeeWorkspace()).data || emptyState();
         const workspace = incoming || emptyState();
         workspace.users = Array.isArray(workspace.users) ? workspace.users : [];
         const existing = workspace.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
@@ -637,7 +657,8 @@ window.firebaseHub = {
     if (json === lastStateJson && (!admin || privateJson === lastPrivateJson)) return;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       if (json !== lastStateJson) {
-        await set(ref(database, workspacePath), cleaned);
+        if (admin) await set(ref(database, workspacePath), cleaned);
+        else await saveEmployeeWorkspace({ state: cleaned });
         lastStateJson = json;
       }
       if (admin && privateDataAvailable && privateJson !== lastPrivateJson) {

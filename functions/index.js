@@ -4,9 +4,9 @@ const { getAuth } = require('firebase-admin/auth');
 const { getDatabase } = require('firebase-admin/database');
 
 const ADMIN_EMAIL = 'ashish@arpitatravels.com';
-  const resubmitting = requester && before.status === 'Changes Requested' && after.version === (before.version || 1) + 1;
 const STATE_PATH = 'executionHub/workspaces/default/state';
 const USERS_PATH = 'executionHub/users';
+const ADMIN_AUTH_PATH = 'executionHub/admin/authorization';
 const REGION = 'asia-southeast1';
 initializeApp({ databaseURL: 'https://project-hub-emp-default-rtdb.asia-southeast1.firebasedatabase.app' });
 const db = getDatabase();
@@ -14,12 +14,16 @@ const db = getDatabase();
 function requireSignedIn(request) {
   if (!request.auth?.uid || !request.auth.token.email) throw new HttpsError('unauthenticated', 'Sign in is required.');
 }
-function isAdmin(request) {
-  return request.auth?.token.email?.toLowerCase() === ADMIN_EMAIL;
+async function isAdmin(request) {
+  const uid = request.auth?.uid;
+  if (!uid) return false;
+  const snapshot = await db.ref(`${ADMIN_AUTH_PATH}/${uid}`).get();
+  const profile = snapshot.val();
+  return profile?.uid === uid && profile.role === 'system_admin' && profile.status === 'active';
 }
-function requireAdmin(request) {
+async function requireAdmin(request) {
   requireSignedIn(request);
-  if (!isAdmin(request)) throw new HttpsError('permission-denied', 'Only the System Admin can perform this action.');
+  if (!(await isAdmin(request))) throw new HttpsError('permission-denied', 'Only the System Admin can perform this action.');
 }
 function clone(value) { return JSON.parse(JSON.stringify(value ?? null)); }
 function stripCredentials(value) {
@@ -198,8 +202,28 @@ function scopedWorkspace(state, profile) {
   };
 }
 
+exports.authorizeSystemAdmin = onCall({ region: REGION }, async request => {
+  requireSignedIn(request);
+  if (request.auth.token.email.toLowerCase() !== ADMIN_EMAIL) return { admin: false };
+
+  const uid = request.auth.uid;
+  const profileRef = db.ref(`${ADMIN_AUTH_PATH}/${uid}`);
+  const transaction = await profileRef.transaction(current => current || {
+    uid,
+    role: 'system_admin',
+    status: 'active',
+    email: ADMIN_EMAIL,
+    createdAt: new Date().toISOString()
+  });
+  const profile = transaction.snapshot.val();
+  if (profile?.uid !== uid || profile.role !== 'system_admin' || profile.status !== 'active') {
+    throw new HttpsError('permission-denied', 'The System Admin authorization profile is invalid or disabled.');
+  }
+  return { admin: true, uid };
+});
+
 exports.createEmployeeProfile = onCall({ region: REGION }, async request => {
-  requireAdmin(request);
+  await requireAdmin(request);
   const profile = request.data?.profile;
   const uid = String(request.data?.uid || '');
   if (!uid || !profile || profile.role !== 'employee' || profile.createdBy !== ADMIN_EMAIL || !['active', 'inactive', 'resigned', 'suspended'].includes(profile.status)) throw new HttpsError('invalid-argument', 'Invalid employee profile.');
@@ -210,7 +234,7 @@ exports.createEmployeeProfile = onCall({ region: REGION }, async request => {
 });
 
 exports.saveEmployeeProfile = onCall({ region: REGION }, async request => {
-  requireAdmin(request);
+  await requireAdmin(request);
   const profile = request.data?.profile;
   const uid = String(request.data?.uid || '');
   if (!uid || uid === request.auth.uid || !profile || profile.role !== 'employee' || profile.createdBy !== ADMIN_EMAIL || profile.email?.toLowerCase() === ADMIN_EMAIL) throw new HttpsError('invalid-argument', 'Invalid or protected employee profile.');
@@ -225,7 +249,7 @@ exports.saveEmployeeProfile = onCall({ region: REGION }, async request => {
 
 exports.loadWorkspace = onCall({ region: REGION }, async request => {
   requireSignedIn(request);
-  if (isAdmin(request)) {
+  if (await isAdmin(request)) {
     const snapshot = await db.ref(STATE_PATH).get();
     return snapshot.exists() ? snapshot.val() : {};
   }
@@ -243,7 +267,7 @@ exports.loadWorkspace = onCall({ region: REGION }, async request => {
 
 exports.saveWorkspace = onCall({ region: REGION }, async request => {
   requireSignedIn(request);
-  if (isAdmin(request)) throw new HttpsError('invalid-argument', 'Admin clients write the workspace directly.');
+  if (await isAdmin(request)) throw new HttpsError('invalid-argument', 'Admin clients write the workspace directly.');
   const uid = request.auth.uid;
   const [profileSnapshot, stateRef] = await Promise.all([db.ref(`${USERS_PATH}/${uid}`).get(), Promise.resolve(db.ref(STATE_PATH))]);
   const profile = profileSnapshot.val();

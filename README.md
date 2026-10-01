@@ -21,7 +21,7 @@ This package is the clean functional prototype prepared for developer review bef
 
 The final review build contains no seeded employees, email addresses, passwords, projects, departments, tasks, approvals or meetings.
 
-There is no in-app registration or first-user Admin flow. The single System Admin is created manually in Firebase Authentication using `ashish@arpitatravels.com`. Only that exact authenticated email receives Admin access. The Admin creates employee Auth accounts from **People & Departments**.
+There is no in-app registration or first-user Admin flow. The single System Admin is created manually in Firebase Authentication using `ashish@arpitatravels.com`. On first sign-in, the trusted `authorizeSystemAdmin` callable creates the UID-keyed authorization record at `executionHub/admin/authorization/{uid}` with `role: "system_admin"`; browser and database authorization then use that UID-backed profile. The Admin creates employee Auth accounts from **People & Departments**.
 
 ## Firebase setup
 
@@ -44,7 +44,7 @@ The browser app is connected to the Firebase project configured in `firebase-boo
 
 ### Authorization boundaries
 
-`database.rules.json` denies unauthenticated access, permits direct shared-state reads/writes only to the fixed Admin email, permits employees to read only their own profile, and permits only Admin profile writes. Employee app data is loaded/saved through `functions/index.js`: the callable functions verify the Firebase UID, employee profile, active status, project membership, ownership, and selected mutable fields before returning or merging workspace data. Employee saves cannot modify profile/role records or delete historical records.
+`database.rules.json` denies unauthenticated access and limits direct shared-workspace access to the UID-backed System Admin profile. Employees load and save project-scoped workspace data through the callable functions, which validate profile status, project membership, ownership, and mutable fields. Employees can read only their own profile; only the System Admin can manage employee profiles or access `executionHub/admin/private`. This also prevents access to legacy private records that may still be present in the shared workspace before the Admin's first successful migration.
 
 This is stronger than UI-only gating, but privileged app logic still resides in Cloud Functions. Keep the Admin Auth account secured with MFA, monitor function/audit logs, and review the callable permission allowlists as workflows evolve. The callable state merge deliberately favors denying unsupported employee mutations; new workflow features must be added to the server validator, not just the browser UI. RTDB rules cannot provide strong per-record authorization for the existing shared JSON state by themselves.
 
