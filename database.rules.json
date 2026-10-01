@@ -61,6 +61,7 @@
         }
       },
       "migrationBackups": {
+        ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
         "$backupId": {
           ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
           ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"

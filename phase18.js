@@ -202,6 +202,19 @@
     if(!isAdmin()||uid===DIRECTOR)return;const u=safeUser(uid);if(u.email?.toLowerCase()===window.firebaseHub.SYSTEM_ADMIN_EMAIL.toLowerCase())return toast('The System Admin account cannot be deactivated.');const next=u.status==='active'?'inactive':'active';if(next==='inactive'&&!confirm(`Deactivate ${u.name}'s login? Department membership, project history, tasks, comments and audit records will remain.`))return;u.status=next;u.active=next==='active';window.firebaseHub.updateEmployeeStatus(u.authUid,next).then(()=>{logOrg(`${next==='active'?'reactivated':'deactivated'} ${u.name}'s login`,`Department: ${departmentName(u)} • History retained`);save();populateUserSelect();render();toast(`${u.name}'s login is now ${next}.`)}).catch(error=>toast(error.message||'Could not update employee status.'))
   }
 
+  async function deleteEmployee(uid){
+    if(!isAdmin())return toast('Only Director / Admin can remove employees.');
+    const employee=safeUser(uid);
+    if(employee.id===DIRECTOR||employee.email?.toLowerCase()===window.firebaseHub.SYSTEM_ADMIN_EMAIL.toLowerCase())return toast('The System Admin account cannot be removed.');
+    if(!confirm(`Mark ${employee.name} as exited and block their application access? Their Firebase Auth account will remain, and all projects, assignments and history will be retained.`))return;
+    try{
+      if(employee.authUid)await window.firebaseHub.updateEmployeeStatus(employee.authUid,'exited');
+      employee.status='exited';employee.active=false;
+      logOrg(`marked ${employee.name} as exited`,`Employee ID: ${employee.employeeId||'—'} • Historical records retained`);
+      await save();populateUserSelect();render();toast(`${employee.name} was removed from active employees. Historical records were retained.`);
+    }catch(error){toast(window.firebaseHub.friendlyError(error))}
+  }
+
   function departmentStats(d){
     const members=deptMembers(d.id,true),active=members.filter(u=>u.active!==false),ids=new Set(members.map(u=>u.id));
     const tasks=state.tasks.filter(t=>ids.has(t.owner)),open=tasks.filter(t=>t.status!=='Completed'),over=open.filter(t=>isOverdue(t));
@@ -215,7 +228,7 @@
   function employeeCard(u){
     const protectedAdmin=u.email?.toLowerCase()===window.firebaseHub.SYSTEM_ADMIN_EMAIL.toLowerCase();
     const d=userDept(u),tasks=state.tasks.filter(t=>t.owner===u.id),led=state.projects.filter(p=>p.projectLead===u.id&&p.lifecycle!=='Archived'),member=state.projects.filter(p=>(p.team||[]).includes(u.id)&&p.projectLead!==u.id&&p.lifecycle!=='Archived');
-    return `<div class="team-card employee-card ${u.active===false?'inactive-card':''}" data-user-id="${u.id}">${avatar(u.id)}<strong>${esc(u.name)}</strong><div class="role">${esc(u.designation||u.role)}${u.jobRole?` • ${esc(u.jobRole)}`:''}</div><div class="employee-department"><span>${esc(d?.name||u.dept||'Unassigned')}</span>${d?.headId===u.id?'<em>Department Head</em>':''}</div><span class="access-badge ${u.active===false?'inactive':'team-member'}">${protectedAdmin?'System Admin':u.status||'active'}</span><div class="credential-line"><span>Login</span><strong>${esc(u.email||'—')}</strong></div><div class="team-numbers"><div class="team-num"><b>${led.length}</b><span>LEADS</span></div><div class="team-num"><b>${member.length}</b><span>PROJECTS</span></div><div class="team-num"><b>${tasks.filter(t=>t.status!=='Completed').length}</b><span>OPEN</span></div></div>${u.reportingTo?`<div class="last-login">Reports to: ${esc(safeUser(u.reportingTo).name)}</div>`:''}${isAdmin()&&!protectedAdmin?`<div class="member-actions"><button class="btn btn-ghost org-performance" data-user="${u.id}">Performance</button><button class="btn btn-ghost org-edit-employee" data-user="${u.id}">Manage</button><button class="btn ${u.active===false?'btn-soft':'btn-danger'} org-toggle-employee" data-user="${u.id}">${u.active===false?'Activate Login':'Deactivate Login'}</button></div>`:''}</div>`
+    return `<div class="team-card employee-card ${u.active===false?'inactive-card':''}" data-user-id="${u.id}">${avatar(u.id)}<strong>${esc(u.name)}</strong><div class="role">${esc(u.designation||u.role)}${u.jobRole?` • ${esc(u.jobRole)}`:''}</div><div class="employee-department"><span>${esc(d?.name||u.dept||'Unassigned')}</span>${d?.headId===u.id?'<em>Department Head</em>':''}</div><span class="access-badge ${u.active===false?'inactive':'team-member'}">${protectedAdmin?'System Admin':u.status||'active'}</span><div class="credential-line"><span>Login</span><strong>${esc(u.email||'—')}</strong></div>${isAdmin()&&u.employeeId?`<div class="credential-line"><span>Employee ID</span><strong>${esc(u.employeeId)}</strong></div>`:''}${isAdmin()&&u.authUid?`<div class="credential-line"><span>Firebase UID</span><strong>${esc(u.authUid)}</strong></div>`:''}${isAdmin()&&u.createdAt?`<div class="last-login">Account created: ${esc(new Date(u.createdAt).toLocaleDateString('en-IN'))}</div>`:''}<div class="team-numbers"><div class="team-num"><b>${led.length}</b><span>LEADS</span></div><div class="team-num"><b>${member.length}</b><span>PROJECTS</span></div><div class="team-num"><b>${tasks.filter(t=>t.status!=='Completed').length}</b><span>OPEN</span></div></div>${u.reportingTo?`<div class="last-login">Reports to: ${esc(safeUser(u.reportingTo).name)}</div>`:''}${isAdmin()&&!protectedAdmin?`<div class="member-actions"><button class="btn btn-ghost org-performance" data-user="${u.id}">Performance</button><button class="btn btn-ghost org-edit-employee" data-user="${u.id}">Edit Employee</button><button class="btn ${u.active===false?'btn-soft':'btn-danger'} org-toggle-employee" data-user="${u.id}">${u.active===false?'Activate Login':'Deactivate Login'}</button>${u.status==='exited'?'':`<button class="btn btn-danger org-delete-employee" data-user="${u.id}">Delete Employee</button>`}</div>`:''}</div>`
   }
 
   renderTeam=function(){
@@ -280,6 +293,7 @@
     });
     document.querySelectorAll('.org-reset-employee').forEach(b=>b.onclick=()=>sendEmployeePasswordReset(b.dataset.user));
     document.querySelectorAll('.org-toggle-employee').forEach(b=>b.onclick=()=>toggleEmployee(b.dataset.user));
+    document.querySelectorAll('.org-delete-employee').forEach(b=>b.onclick=()=>deleteEmployee(b.dataset.user));
     document.querySelectorAll('.org-performance').forEach(b=>b.onclick=()=>{activeView='performance';activeProject=null;render();setTimeout(()=>{const open=el('openIndividualsFromCompany');if(open)open.click();setTimeout(()=>{const btn=document.querySelector(`[data-perf-user="${b.dataset.user}"]`);if(btn)btn.click()},0)},0)});
     const back=el('backDepartments');if(back)back.onclick=()=>{orgFocusDept=null;orgTab='departments';render()};
     const md=el('manageDepartmentDetail');if(md)md.onclick=()=>openDepartment(deptById(orgFocusDept));
