@@ -12,7 +12,6 @@ import {
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import { get, getDatabase, onValue, ref, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
-import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-functions.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
 const AUTH_LOADING = 'AUTH_LOADING';
@@ -22,26 +21,24 @@ const firebaseConfig = {
   apiKey: 'AIzaSyC0gOy_JIaIpds2BdoHGv20EZiuHt8ozvM',
   authDomain: 'project-hub-emp.firebaseapp.com',
   databaseURL: 'https://project-hub-emp-default-rtdb.asia-southeast1.firebasedatabase.app',
-  projectId: 'project-hub-emp',
+        const incoming = await readEmployeeWorkspace(employeeProfile);
   storageBucket: 'project-hub-emp.firebasestorage.app',
   messagingSenderId: '360406593945',
   appId: '1:360406593945:web:3ca19e86849053b4f76308',
   measurementId: 'G-DQC30WE2XH'
 };
 
-const workspacePath = 'executionHub/workspaces/default/state';
+const legacyWorkspacePath = 'executionHub/workspaces/default/state';
+const workspacePath = 'executionHub/workspace/employeeVisibleData/state';
+const employeeDirectoryPath = 'executionHub/workspace/employeeVisibleData/directory';
+const adminManagementPath = 'executionHub/admin/employeeManagement';
 const employeeProfilesPath = 'executionHub/users';
-const adminAuthorizationPath = 'executionHub/admin/authorization';
 const privateDataPath = 'executionHub/admin/private';
 const workspaceCollections = ['users', 'departments', 'projects', 'tasks', 'approvals', 'approvalHistory', 'comments', 'activity', 'calendarEvents'];
-const privateCollections = ['performanceReviews', 'performanceSnapshots'];
+const privateCollections = ['performanceReviews', 'performanceSnapshots', 'payroll', 'salary', 'salaryRecords', 'overtime', 'overtimeRecords', 'compensation', 'management', 'managementPrivate'];
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const database = getDatabase(app);
-const functions = getFunctions(app, 'asia-southeast1');
-const authorizeSystemAdmin = httpsCallable(functions, 'authorizeSystemAdmin');
-const loadEmployeeWorkspace = httpsCallable(functions, 'loadWorkspace');
-const saveEmployeeWorkspace = httpsCallable(functions, 'saveWorkspace');
 const employeeCreationApp = initializeApp(firebaseConfig, 'employeeCreation');
 const employeeCreationAuth = getAuth(employeeCreationApp);
 let authUser = null;
@@ -50,10 +47,11 @@ let systemAdminUid = null;
 let stopWatching = null;
 let stopProfileWatch = null;
 let stopPrivateWatching = null;
+let stopManagementWatching = null;
 let appLoaded = false;
 let lastStateJson = null;
 let lastPrivateJson = null;
-let lastPrivateData = { performanceReviews: [], performanceSnapshots: [] };
+let lastPrivateData = Object.fromEntries(privateCollections.map(collection => [collection, []]));
 let privateDataAvailable = false;
 let legacyPrivateDataPending = false;
 let saveQueue = Promise.resolve();
@@ -63,6 +61,7 @@ let authFlow = Promise.resolve();
 let handlingUid = null;
 let pendingAuthMessage = '';
 let legacyState = null;
+let adminManagement = { users: [], departments: [] };
 let firebaseAuthState = AUTH_LOADING;
 
 function setFirebaseAuthState(nextState) {
@@ -80,6 +79,7 @@ function setFirebaseAuthState(nextState) {
     } else {
       overlay.innerHTML = '<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Loading your workspace...</h1><p>Please wait while your secure session is restored.</p></div>';
       overlay.classList.add('open');
+
     }
     return;
   }
@@ -99,15 +99,14 @@ function isSystemAdmin(user = auth.currentUser) {
 function emptyState() {
   return {
     currentUser: null, users: [], departments: [], projects: [], tasks: [], approvals: [], approvalHistory: [],
-    comments: [], activity: [], calendarEvents: [], plannerRead: {}, performanceReviews: [], performanceSnapshots: []
+    comments: [], activity: [], calendarEvents: [], plannerRead: {}, ...Object.fromEntries(privateCollections.map(collection => [collection, []]))
   };
 }
 
 function cleanState(value) {
   const result = JSON.parse(JSON.stringify(value || emptyState()));
   delete result.currentUser;
-  delete result.performanceReviews;
-  delete result.performanceSnapshots;
+  privateCollections.forEach(collection => delete result[collection]);
   result.users = (result.users || []).filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase());
   result.users.forEach(account => {
     delete account.passwordHash;
@@ -115,6 +114,29 @@ function cleanState(value) {
     delete account.temporaryPassword;
   });
   return result;
+}
+
+function cleanWorkspaceState(value) {
+  const result = cleanState(value);
+  delete result.users;
+  delete result.departments;
+  return result;
+}
+
+function safeDirectory(state) {
+  const users = recordsFrom(state?.users)
+    .filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase())
+    .map(account => {
+      const safe = { ...account };
+      ['mobile', 'phone', 'reportingTo', 'dateJoined', 'joiningDate', 'departmentHistory', 'createdBy', 'temporaryPassword', 'password', 'passwordHash', 'authUid', 'firebaseUid', 'uid'].forEach(key => delete safe[key]);
+      return safe;
+    });
+  const departments = recordsFrom(state?.departments).map(({ id, name, code, headId, active }) => ({ id, name, code, headId, active }));
+  return { users, departments };
+}
+
+function managementRecords(state) {
+  return { users: recordsFrom(state?.users), departments: recordsFrom(state?.departments) };
 }
 
 function recordsFrom(value) {
@@ -184,20 +206,62 @@ function containsLegacyCredentials(value) {
 }
 
 async function readWorkspace() {
-  const snapshot = await get(ref(database, workspacePath));
-  const value = snapshot.exists() ? snapshot.val() : null;
+  const [workspaceSnapshot, directorySnapshot, managementSnapshot] = await Promise.all([
+    get(ref(database, workspacePath)),
+    get(ref(database, employeeDirectoryPath)),
+    get(ref(database, adminManagementPath))
+  ]);
+  let value = workspaceSnapshot.exists() ? workspaceSnapshot.val() : null;
+  if (!value) {
+    const legacySnapshot = await get(ref(database, legacyWorkspacePath));
+    if (legacySnapshot.exists()) {
+      value = normalizeWorkspace(legacySnapshot.val());
+      stripLegacyCredentials(value);
+      const directory = safeDirectory(value);
+      adminManagement = managementRecords(value);
+      await Promise.all([
+        set(ref(database, workspacePath), cleanWorkspaceState(value)),
+        set(ref(database, employeeDirectoryPath), directory),
+        set(ref(database, adminManagementPath), adminManagement)
+      ]);
+    }
+  }
+  const storedManagement = managementSnapshot.exists() ? managementSnapshot.val() : adminManagement;
+  if (storedManagement && (storedManagement.users || storedManagement.departments)) adminManagement = storedManagement;
+  const directory = directorySnapshot.exists() ? directorySnapshot.val() : safeDirectory(value || {});
+  value = { ...(value || emptyState()), ...(directory || {}), users: adminManagement.users || [], departments: adminManagement.departments || [] };
   captureRecordKeys(value, workspaceCollections, workspaceRecordKeys);
   return normalizeWorkspace(value);
 }
 
+async function readEmployeeWorkspace(profile) {
+  const [workspaceSnapshot, directorySnapshot] = await Promise.all([
+    get(ref(database, workspacePath)),
+    get(ref(database, employeeDirectoryPath))
+  ]);
+  const directory = directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] };
+  const state = { ...emptyState(), ...(workspaceSnapshot.exists() ? workspaceSnapshot.val() : {}), ...directory };
+  state.users = recordsFrom(state.users);
+  state.departments = recordsFrom(state.departments);
+  const own = appUserFromEmployee(profile);
+  const index = state.users.findIndex(account => account.id === own.id || account.authUid === profile.uid);
+  if (index < 0) state.users.push(own);
+  else state.users[index] = { ...state.users[index], ...own };
+  return normalizeWorkspace(state);
+}
+
 async function loadPrivateAdminData(state) {
-  const snapshot = await get(ref(database, privateDataPath));
+  const [snapshot, legacySnapshot] = await Promise.all([
+    get(ref(database, privateDataPath)),
+    get(ref(database, legacyWorkspacePath))
+  ]);
   const stored = snapshot.exists() ? snapshot.val() : {};
+  const legacyStateValue = legacySnapshot.exists() ? legacySnapshot.val() : {};
   const migration = {};
   const privateData = { ...stored };
 
   privateCollections.forEach(collection => {
-    const legacy = state[collection];
+    const legacy = mergeRecordsById(state[collection], legacyStateValue[collection]);
     const storedCollection = stored[collection] || {};
     const collectionData = Array.isArray(storedCollection)
       ? Object.fromEntries(storedCollection.map((record, index) => [String(index), record]))
@@ -274,21 +338,14 @@ async function authorize(user) {
   if (!user?.email) throw new Error('Your Firebase account does not have an email address.');
   systemAdminUid = null;
   if (user.email.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()) {
-    const result = (await authorizeSystemAdmin()).data;
-    if (result?.admin === true && result.uid === user.uid) {
-      const snapshot = await get(ref(database, `${adminAuthorizationPath}/${user.uid}`));
-      const authorization = snapshot.exists() ? snapshot.val() : null;
-      if (authorization?.uid === user.uid && authorization.role === 'system_admin' && authorization.status === 'active') {
-        systemAdminUid = user.uid;
-      }
-    }
+    systemAdminUid = user.uid;
   }
   const admin = isSystemAdmin(user);
   let profile = null;
   if (!admin) {
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${user.uid}`));
     profile = snapshot.exists() ? snapshot.val() : null;
-    if (!profile || profile.uid !== user.uid || profile.role !== 'employee') {
+    if (!profile || profile.uid !== user.uid || profile.email?.toLowerCase() !== user.email.toLowerCase() || profile.role !== 'employee') {
       throw Object.assign(new Error('Your account is not authorized for this application. Please contact the administrator.'), { code: 'app/not-authorized' });
     }
     if (profile.status !== 'active') {
@@ -304,6 +361,7 @@ async function authorize(user) {
 
   let state;
   let scrubCloudCredentials = false;
+  let restoredLocalState = false;
   if (admin) {
     state = await readWorkspace();
     scrubCloudCredentials = containsLegacyCredentials(state);
@@ -312,10 +370,9 @@ async function authorize(user) {
     if (!hasCloudRecords && legacyState) {
       state = legacyState;
       legacyState = null;
+      restoredLocalState = true;
     }
-  } else {
-    state = (await loadEmployeeWorkspace()).data || emptyState();
-  }
+  } else state = await readEmployeeWorkspace(profile);
   state = { ...emptyState(), ...(state || {}) };
   if (admin) {
     try {
@@ -324,7 +381,7 @@ async function authorize(user) {
       if (!isDatabasePermissionDenied(error)) throw error;
       legacyPrivateDataPending = privateCollections.some(collection => recordsFrom(state[collection]).length > 0);
       privateDataAvailable = false;
-      lastPrivateData = { performanceReviews: [], performanceSnapshots: [] };
+      lastPrivateData = Object.fromEntries(privateCollections.map(collection => [collection, []]));
       lastPrivateJson = JSON.stringify(lastPrivateData);
       privateCollections.forEach(collection => { state[collection] = []; });
       console.warn('Private management data is unavailable until Realtime Database rules grant System Admin access.');
@@ -332,7 +389,12 @@ async function authorize(user) {
   } else privateCollections.forEach(collection => { state[collection] = []; });
   if (admin) {
     state = ensureAdminProfile(state, user);
-    if (scrubCloudCredentials && !legacyPrivateDataPending) await set(ref(database, workspacePath), cleanState(state));
+    if (scrubCloudCredentials && !legacyPrivateDataPending) {
+      await set(ref(database, workspacePath), cleanWorkspaceState(state));
+      await set(ref(database, employeeDirectoryPath), safeDirectory(state));
+      adminManagement = managementRecords(state);
+      await set(ref(database, adminManagementPath), adminManagement);
+    }
   } else {
     state.users = Array.isArray(state.users) ? state.users : [];
     const existing = state.users.find(account => account.authUid === user.uid || account.id === profile.appUserId);
@@ -345,7 +407,7 @@ async function authorize(user) {
   employeeProfile = profile;
   window.firebaseHub.initialState = state;
   window.firebaseHub.employeeProfile = profile;
-  lastStateJson = JSON.stringify(cleanState(state));
+  lastStateJson = restoredLocalState ? null : JSON.stringify(cleanWorkspaceState(state));
   return { state, admin, profile };
 }
 
@@ -368,8 +430,6 @@ function friendlyAuthError(error) {
   if (code === 'auth/email-already-in-use') return 'An account already exists for this email.';
   if (code === 'auth/weak-password') return 'The temporary password must contain at least 6 characters.';
   if (code === 'auth/operation-not-allowed') return 'Email and password sign-in is not enabled in Firebase Console.';
-  if (code === 'functions/unauthenticated' || code === 'functions/permission-denied') return 'Your account is not authorized for this application. Please contact the administrator.';
-  if (code === 'functions/unavailable' || code === 'functions/internal') return 'The secure application service is unavailable. Please contact the administrator.';
   if (code === 'PERMISSION_DENIED' || error?.message?.includes('PERMISSION_DENIED')) return 'Firebase denied access. Check the deployed Realtime Database rules.';
   return error?.message || 'Unable to complete the Firebase request. Please try again.';
 }
@@ -452,6 +512,8 @@ async function handleAuthState(user) {
     stopProfileWatch = null;
     if (stopPrivateWatching) stopPrivateWatching();
     stopPrivateWatching = null;
+    if (stopManagementWatching) stopManagementWatching();
+    stopManagementWatching = null;
     firebaseAuthState = SIGNED_OUT;
     showLogin(pendingAuthMessage);
     pendingAuthMessage = '';
@@ -498,7 +560,7 @@ function startRealtimeSync() {
     if (stopProfileWatch) stopProfileWatch();
     stopProfileWatch = onValue(ref(database, `${employeeProfilesPath}/${authUser.uid}`), snapshot => {
       const profile = snapshot.val();
-      if (!profile || profile.uid !== authUser.uid || profile.role !== 'employee' || profile.status !== 'active') {
+      if (!profile || profile.uid !== authUser.uid || profile.role !== 'employee' || profile.status !== 'active' || !profile.appUserId) {
         const disabled = profile?.status && profile.status !== 'active';
         pendingAuthMessage = disabled
           ? ({ inactive: 'Your account is inactive. Please contact the administrator.', resigned: 'Your account is marked as resigned. Please contact the administrator.', suspended: 'Your account is suspended. Please contact the administrator.' }[profile.status] || 'Your account is disabled. Please contact the administrator.')
@@ -515,14 +577,14 @@ function startRealtimeSync() {
       if (polling || !authUser) return;
       polling = true;
       try {
-        const incoming = (await loadEmployeeWorkspace()).data || emptyState();
+        const incoming = await readEmployeeWorkspace(employeeProfile);
         const workspace = incoming || emptyState();
         workspace.users = Array.isArray(workspace.users) ? workspace.users : [];
         const existing = workspace.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
         const appProfile = { ...(existing || {}), ...appUserFromEmployee(employeeProfile) };
         if (!existing) workspace.users.push(appProfile);
         else workspace.users[workspace.users.indexOf(existing)] = appProfile;
-        const json = JSON.stringify(cleanState(workspace));
+        const json = JSON.stringify(cleanWorkspaceState(workspace));
         if (json !== lastStateJson) {
           lastStateJson = json;
           window.firebaseHub.initialState = workspace;
@@ -545,20 +607,15 @@ function startRealtimeSync() {
   }
   stopWatching = onValue(ref(database, workspacePath), snapshot => {
     if (!snapshot.exists()) return;
-    const incoming = snapshot.val();
+    const incoming = { ...emptyState(), ...snapshot.val(), ...safeDirectory(adminManagement) };
     if (isSystemAdmin()) {
+      incoming.users = adminManagement.users || incoming.users;
+      incoming.departments = adminManagement.departments || incoming.departments;
       ensureAdminProfile(incoming, authUser);
       Object.assign(incoming, clonePrivateCollections(lastPrivateData));
     }
-    else if (employeeProfile) {
-      privateCollections.forEach(collection => { incoming[collection] = []; });
-      incoming.users = Array.isArray(incoming.users) ? incoming.users : [];
-      const existing = incoming.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
-      const appProfile = { ...(existing || {}), ...appUserFromEmployee(employeeProfile) };
-      if (!existing) incoming.users.push(appProfile);
-      else incoming.users[incoming.users.indexOf(existing)] = appProfile;
-    }
-    const json = JSON.stringify(cleanState(incoming));
+    else return;
+    const json = JSON.stringify(cleanWorkspaceState(incoming));
     if (json === lastStateJson) return;
     lastStateJson = json;
     window.firebaseHub.initialState = incoming;
@@ -570,7 +627,24 @@ function startRealtimeSync() {
     console.error('Firebase live sync failed:', error);
     window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
   });
-  if (isSystemAdmin()) startPrivateAdminSync();
+  if (isSystemAdmin()) {
+    startPrivateAdminSync();
+    startAdminManagementSync();
+  }
+}
+
+function startAdminManagementSync() {
+  if (!isSystemAdmin()) return;
+  if (stopManagementWatching) stopManagementWatching();
+  stopManagementWatching = onValue(ref(database, adminManagementPath), snapshot => {
+    adminManagement = snapshot.exists() ? snapshot.val() : { users: [], departments: [] };
+    const incoming = { ...(window.firebaseHub.initialState || emptyState()), users: adminManagement.users || [], departments: adminManagement.departments || [] };
+    window.firebaseHub.initialState = incoming;
+    if (typeof window.applyFirebaseState === 'function') {
+      window.applyFirebaseState(incoming);
+      window.refreshFirebaseView();
+    }
+  }, error => console.error('Could not monitor private employee-management data:', error));
 }
 
 function startPrivateAdminSync() {
@@ -641,6 +715,8 @@ window.firebaseHub = {
     stopProfileWatch = null;
     if (stopPrivateWatching) stopPrivateWatching();
     stopPrivateWatching = null;
+    if (stopManagementWatching) stopManagementWatching();
+    stopManagementWatching = null;
     await signOut(auth);
   },
   async saveState(state) {
@@ -649,17 +725,27 @@ window.firebaseHub = {
       console.warn('Workspace save skipped to preserve legacy private management data until Admin database rules are available.');
       return;
     }
-    const cleaned = cleanState(state);
+    const cleaned = cleanWorkspaceState(state);
     const json = JSON.stringify(cleaned);
+    const directory = safeDirectory(state);
+    const directoryJson = JSON.stringify(directory);
+    const management = managementRecords(state);
+    const managementJson = JSON.stringify(management);
     const privateSnapshot = clonePrivateCollections(state);
     const privateJson = JSON.stringify(privateSnapshot);
     const admin = isSystemAdmin();
-    if (json === lastStateJson && (!admin || privateJson === lastPrivateJson)) return;
+    if (json === lastStateJson && (!admin || (privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       if (json !== lastStateJson) {
-        if (admin) await set(ref(database, workspacePath), cleaned);
-        else await saveEmployeeWorkspace({ state: cleaned });
+        await set(ref(database, workspacePath), cleaned);
         lastStateJson = json;
+      }
+      if (admin && (directoryJson !== JSON.stringify(safeDirectory(adminManagement)) || managementJson !== JSON.stringify(adminManagement))) {
+        await Promise.all([
+          set(ref(database, employeeDirectoryPath), directory),
+          set(ref(database, adminManagementPath), management)
+        ]);
+        adminManagement = management;
       }
       if (admin && privateDataAvailable && privateJson !== lastPrivateJson) {
         const updates = {};
