@@ -4,6 +4,7 @@
     ".write": false,
     "executionHub": {
       "users": {
+        ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
         "$uid": {
           ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || auth.uid === $uid)",
           ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
