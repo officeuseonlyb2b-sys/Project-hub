@@ -10,6 +10,8 @@
   const activeUsers=()=>state.users.filter(u=>u.active!==false);
   const isDirector=(id=uid())=>id===uid()&&!!window.firebaseHub?.isSystemAdmin();
   const fullProjectAccess=(p,id=uid())=>!!p&&user(id).active!==false&&(isDirector(id)||(p.team||[]).includes(id));
+  const regularTaskAccess=(t,id=uid())=>t?.contextType==='regular_work'&&user(id).active!==false&&!!window.firebaseHub?.canAccessRegularWorkTask(t.id);
+  const fullTaskAccess=(t,id=uid())=>t?.contextType==='regular_work'?regularTaskAccess(t,id):fullProjectAccess(project(t?.project),id);
   const projectLead=(p,id=uid())=>!!p&&p.projectLead===id;
   const wsOwner=(p,ws)=>(p?.workstreams||[]).find(w=>w.name===ws)?.owner;
   const isTerminal=a=>['Approved','Rejected','Cancelled'].includes(a.status);
@@ -76,9 +78,9 @@
 
   function openApprovalCreate(opts={}){
     const linked=opts.task?task(opts.task):null;
-    if(linked&&!fullProjectAccess(project(linked.project)))return toast('Only project members can send this task for approval.');
+    if(linked&&!fullTaskAccess(linked))return toast('You do not have access to this task.');
     const projects=accessibleProjects();
-    const initialProject=linked?.project||opts.project||projects[0]?.id||'';
+    const initialProject=linked?.contextType==='regular_work'?'':linked?.project||opts.project||projects[0]?.id||'';
     const initialApprover=opts.approver|| (linked?defaultApproverForTask(linked):activeUsers().find(x=>x.id!==uid())?.id)||'';
     openModal16(linked?'Send Task for Approval':'New Approval Request',`<form id="approvalCreateForm" class="form-stack approval-form">
       <div class="approval-form-intro"><div class="approval-form-icon">✓</div><div><strong>Approval follows the work, not the hierarchy.</strong><span>Choose any active colleague who is the right person to review this. Their access is limited to this request and its linked material unless they already belong to the project.</span></div></div>
@@ -104,7 +106,8 @@
       <div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelApprovalCreate">Cancel</button><button class="btn btn-soft" type="submit">Send for Approval</button></div>
     </form>`);
     const form=el('approvalCreateForm'),pSel=el('approvalProject'),tSel=el('approvalTask');
-    function loadTasks(){const pid=pSel.value;const rows=pid?state.tasks.filter(t=>t.project===pid&&fullProjectAccess(project(pid))):[];tSel.innerHTML='<option value="">No linked task</option>'+rows.map(t=>`<option value="${t.id}" ${linked?.id===t.id?'selected':''}>${esc(t.title)}</option>`).join('')}
+    if(linked?.contextType==='regular_work'){pSel.value='';pSel.disabled=true;}
+    function loadTasks(){const pid=pSel.value,rows=linked?.contextType==='regular_work'?[linked]:pid?state.tasks.filter(t=>t.project===pid&&t.contextType!=='regular_work'&&fullProjectAccess(project(pid))):[];tSel.innerHTML='<option value="">No linked task</option>'+rows.map(t=>`<option value="${t.id}" ${linked?.id===t.id?'selected':''}>${esc(t.contextType==='regular_work'?`Regular Work · ${t.regularFolderName} · ${t.title}`:t.title)}</option>`).join('')}
     loadTasks();pSel.onchange=loadTasks;
     el('cancelApprovalCreate').onclick=closeModal16;
     form.onsubmit=e=>{
@@ -112,7 +115,7 @@
       if(!approvers.length)return toast('Select at least one approver.');
       if(approvers.includes(uid()))return toast('You cannot approve your own request.');
       const tid=fd.get('task')||null,t=tid?task(tid):null,pid=t?.project||fd.get('project')||null;
-      const a={id:'a'+Date.now(),type:fd.get('type'),task:tid,project:pid,title:fd.get('title').trim(),requestedBy:uid(),approvers,approvalMode:fd.get('approvalMode'),status:'Pending',priority:fd.get('priority'),requestedAt:nowIso(),dueAt:new Date(fd.get('dueAt')).toISOString(),detail:fd.get('detail').trim(),version:1,reference:(fd.get('reference')||'').trim(),blocking:fd.get('blocking')==='on'&&!!tid,autoComplete:fd.get('autoComplete')==='on'&&!!tid,decisions:{},comments:[],rounds:[]};
+      const a={id:'a'+Date.now(),type:fd.get('type'),contextType:t?.contextType||'project',task:tid,project:pid,title:fd.get('title').trim(),requestedBy:uid(),approvers,approvalMode:fd.get('approvalMode'),status:'Pending',priority:fd.get('priority'),requestedAt:nowIso(),dueAt:new Date(fd.get('dueAt')).toISOString(),detail:fd.get('detail').trim(),version:1,reference:(fd.get('reference')||'').trim(),blocking:fd.get('blocking')==='on'&&!!tid,autoComplete:fd.get('autoComplete')==='on'&&!!tid,decisions:{},comments:[],rounds:[]};
       state.approvals.unshift(a);
       if(t&&a.blocking){t.approvalBlockId=a.id;t.waitingOn=approvers.length===1?approvers[0]:'Approval';if(t.status==='Not Started')t.status='Waiting'}
       log(uid(),pid,tid,'Approval',`sent ${a.type.toLowerCase()} to ${approverNames(a)}`,`Due: ${new Date(a.dueAt).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}${a.reference?' • '+a.reference:''}`);
@@ -218,9 +221,14 @@
   const baseOpenTask16=openTask;
   openTask=function(id){
     const t=task(id);if(!t)return;const p=project(t.project);
-    if(!fullProjectAccess(p)&&hasApprovalTaskAccess(id)){readOnlyApprovalTask(t);return}
-    baseOpenTask16(id);
-    if(!fullProjectAccess(p))return;
+    if(t.contextType==='regular_work'){
+      if(!regularTaskAccess(t))return toast('You do not have access to this Regular Work task.');
+      baseOpenTask16(id);
+    }else{
+      if(!fullProjectAccess(p)&&hasApprovalTaskAccess(id)){readOnlyApprovalTask(t);return}
+      baseOpenTask16(id);
+      if(!fullProjectAccess(p))return;
+    }
     const body=el('drawerBody');if(!body)return;
     const aps=approvalsForTask(id);
     const first=body.querySelector('.drawer-section');
@@ -234,16 +242,16 @@
 
   // Flexible Ready-for-Review: choose the right approver rather than automatically routing upward.
   updateStatus=function(id,newStatus){
-    const t=task(id);if(!t)return;const p=project(t.project);const editable=fullProjectAccess(p)&&(isDirector()||p.projectLead===uid()||wsOwner(p,t.workstream)===uid()||t.owner===uid());if(!editable)return toast('You do not have permission to update this task.');
+    const t=task(id);if(!t)return;const p=project(t.project);const editable=t.contextType==='regular_work'?canEditTask(t):fullProjectAccess(p)&&(isDirector()||p.projectLead===uid()||wsOwner(p,t.workstream)===uid()||t.owner===uid());if(!editable)return toast('You do not have permission to update this task.');
     const old=t.status;if(old===newStatus)return toast('Task is already in that status.');t.status=newStatus;if(newStatus==='Ready for Review')t.progress=100;log(uid(),t.project,t.id,'Status',`changed status from ${old} to ${newStatus}`,`${old} → ${newStatus}`);save();toast(`Status updated to ${newStatus}`);openTask(id);render();if(newStatus==='Ready for Review')setTimeout(()=>openApprovalCreate({task:id,title:t.title,approver:defaultApproverForTask(t)}),120);
   };
 
   // Deadline changes remain controlled by Project Lead / Director, but use the same approval desk.
   requestDeadline=function(id){
-    const t=task(id);if(!t)return;const p=project(t.project);if(!fullProjectAccess(p))return toast('You do not have project access.');
+    const t=task(id);if(!t)return;const p=project(t.project);if(t.contextType==='regular_work'?!canEditTask(t):!fullProjectAccess(p))return toast('You do not have access to change this task deadline.');
     const input=prompt(`Current due date is ${t.currentDue}. Enter requested new due date (YYYY-MM-DD):`,t.currentDue);if(!input||input===t.currentDue)return;const reason=prompt('Reason for deadline change:','');if(!reason)return;
-    const approver=(p.projectLead!==uid()?p.projectLead:null)||directorId;if(approver===uid())return toast('No separate approver is available for this control change.');
-    const a={id:'a'+Date.now(),type:'Deadline Change',task:id,project:t.project,title:`Deadline revision • ${t.title}`,requestedBy:uid(),approvers:[approver],approvalMode:'all',status:'Pending',priority:t.priority==='P0'?'Critical':'High',requestedAt:nowIso(),dueAt:new Date(Date.now()+86400000).toISOString(),detail:`Requested ${fmtDateFull(input)}. Reason: ${reason}`,version:1,reference:`Original due ${fmtDateFull(t.originalDue)}`,blocking:false,autoComplete:false,decisions:{},comments:[],rounds:[],requestedDue:input};
+    const approver=t.contextType==='regular_work'?(t.reviewer!==uid()?t.reviewer:null):(p?.projectLead!==uid()?p?.projectLead:null)||directorId;if(!approver||approver===uid())return toast('No separate approver is available for this control change.');
+    const a={id:'a'+Date.now(),type:'Deadline Change',contextType:t.contextType||'project',task:id,project:t.project||null,title:`Deadline revision • ${t.title}`,requestedBy:uid(),approvers:[approver],approvalMode:'all',status:'Pending',priority:t.priority==='P0'?'Critical':'High',requestedAt:nowIso(),dueAt:new Date(Date.now()+86400000).toISOString(),detail:`Requested ${fmtDateFull(input)}. Reason: ${reason}`,version:1,reference:`Original due ${fmtDateFull(t.originalDue)}`,blocking:false,autoComplete:false,decisions:{},comments:[],rounds:[],requestedDue:input};
     state.approvals.unshift(a);t.pendingDue=input;log(uid(),t.project,id,'Deadline','requested deadline revision',`Current: ${fmtDateFull(t.currentDue)} → Requested: ${fmtDateFull(input)} • Approver: ${user(approver).name}`);save();toast('Deadline change sent to the Project Lead / Director.');openTask(id);render();
   };
 

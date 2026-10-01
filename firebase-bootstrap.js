@@ -36,6 +36,16 @@ const privateDataPath = 'executionHub/admin/private';
 const migrationBackupsPath = 'executionHub/migrationBackups';
 const migrationMetadataPath = 'executionHub/system/migrations/sparkMigrationV1';
 const migrationId = 'sparkMigrationV1';
+const regularWorkPath = 'executionHub/regularWork';
+const regularWorkOwnersPath = `${regularWorkPath}/owners`;
+const regularWorkTasksPath = `${regularWorkPath}/tasks`;
+const regularWorkTaskAccessPath = `${regularWorkPath}/taskAccess`;
+const regularWorkCommentsPath = `${regularWorkPath}/comments`;
+const regularWorkApprovalsPath = `${regularWorkPath}/approvals`;
+const regularWorkActivityPath = `${regularWorkPath}/activity`;
+const regularWorkOwnerActivityPath = `${regularWorkPath}/ownerActivity`;
+const regularWorkCalendarPath = `${regularWorkPath}/calendarEvents`;
+const regularWorkDailyTasksPath = `${regularWorkPath}/dailyTasks`;
 const workspaceCollections = ['users', 'departments', 'projects', 'tasks', 'approvals', 'approvalHistory', 'comments', 'activity', 'calendarEvents'];
 const privateCollections = ['performanceReviews', 'performanceSnapshots', 'attendance', 'attendanceRecords', 'leaves', 'leaveRecords', 'payroll', 'salary', 'salaryRecords', 'overtime', 'overtimeRecords', 'compensation', 'management', 'managementPrivate'];
 const app = initializeApp(firebaseConfig);
@@ -69,6 +79,8 @@ let recoveryPending = false;
 let migrationInProgress = false;
 let appDataWritesEnabled = false;
 let deferredSaveState = null;
+let lastRegularWorkSnapshot = { folders: [], categories: [], tasks: [], comments: [], approvals: [], activity: [], calendarEvents: [] };
+let stopRegularWorkWatching = null;
 let firebaseAuthState = AUTH_LOADING;
 
 function setFirebaseAuthState(nextState) {
@@ -106,7 +118,7 @@ function isSystemAdmin(user = auth.currentUser) {
 function emptyState() {
   return {
     currentUser: null, users: [], departments: [], projects: [], tasks: [], approvals: [], approvalHistory: [],
-    comments: [], activity: [], calendarEvents: [], plannerRead: {}, ...Object.fromEntries(privateCollections.map(collection => [collection, []]))
+    comments: [], activity: [], calendarEvents: [], plannerRead: {}, regularWorkFolders: [], regularWorkCategories: [], ...Object.fromEntries(privateCollections.map(collection => [collection, []]))
   };
 }
 
@@ -126,8 +138,17 @@ function cleanState(value) {
 
 function cleanWorkspaceState(value) {
   const result = cleanState(value);
+  const regularTaskIds = new Set(recordsFrom(result.tasks).filter(task => task.contextType === 'regular_work').map(task => task.id));
+  result.tasks = recordsFrom(result.tasks).filter(task => task.contextType !== 'regular_work');
+  result.comments = recordsFrom(result.comments).filter(comment => !regularTaskIds.has(comment.task));
+  result.approvals = recordsFrom(result.approvals).filter(approval => !regularTaskIds.has(approval.task));
+  result.approvalHistory = recordsFrom(result.approvalHistory).filter(entry => !regularTaskIds.has(entry.task));
+  result.activity = recordsFrom(result.activity).filter(event => event.contextType !== 'regular_work' && !regularTaskIds.has(event.task));
+  result.calendarEvents = recordsFrom(result.calendarEvents).filter(event => event.contextType !== 'regular_work' && !regularTaskIds.has(event.task));
   delete result.users;
   delete result.departments;
+  delete result.regularWorkFolders;
+  delete result.regularWorkCategories;
   return result;
 }
 
@@ -337,6 +358,117 @@ async function readWorkspace() {
   return state;
 }
 
+function recordsWithKeys(value) {
+  if (Array.isArray(value)) return value.filter(record => record && typeof record === 'object');
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).filter(([, record]) => record && typeof record === 'object').map(([key, record]) => ({ ...record, id: record.id || key }));
+}
+
+function recordsGroupedByTask(value) {
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([taskId, records]) => recordsWithKeys(records).map(record => ({ ...record, task: record.task || taskId })));
+}
+
+function cloneRegularWorkSnapshot(data) {
+  return JSON.parse(JSON.stringify({
+    folders: recordsFrom(data?.folders),
+    categories: recordsFrom(data?.categories),
+    tasks: recordsFrom(data?.tasks).map(task=>{const copy={...task};delete copy.accessUserIds;delete copy.approverIds;return copy}),
+    comments: recordsFrom(data?.comments),
+    approvals: recordsFrom(data?.approvals),
+    activity: recordsFrom(data?.activity),
+    ownerActivity: recordsFrom(data?.ownerActivity),
+    calendarEvents: recordsFrom(data?.calendarEvents),
+    access: data?.access || {}
+  }));
+}
+
+async function readRegularWorkData(firebaseUid, admin, employeeProfile = null) {
+  let owners = {};
+  let stored = {};
+  let ownerActivity = {};
+  let allowedTaskIds = [];
+  if (admin) {
+    const snapshot = await get(ref(database, regularWorkPath));
+    stored = snapshot.exists() ? snapshot.val() : {};
+    owners = stored.owners || {};
+    ownerActivity = stored.ownerActivity || {};
+    allowedTaskIds = Object.keys(stored.tasks || {});
+  } else {
+    const [ownerSnapshot, accessSnapshot, ownerActivitySnapshot] = await Promise.all([
+      get(ref(database, `${regularWorkOwnersPath}/${firebaseUid}`)),
+      get(ref(database, `${regularWorkTaskAccessPath}/${employeeProfile?.appUserId || ''}`)),
+      get(ref(database, `${regularWorkOwnerActivityPath}/${firebaseUid}`))
+    ]);
+    owners = ownerSnapshot.exists() ? { [firebaseUid]: ownerSnapshot.val() } : {};
+    ownerActivity = ownerActivitySnapshot.exists() ? { [firebaseUid]: ownerActivitySnapshot.val() } : {};
+    const access = accessSnapshot.exists() ? accessSnapshot.val() : {};
+    allowedTaskIds = Object.entries(access).filter(([, allowed]) => allowed === true).map(([taskId]) => taskId);
+    const taskSnapshots = await Promise.all(allowedTaskIds.map(taskId => get(ref(database, `${regularWorkTasksPath}/${taskId}`))));
+    stored.tasks = Object.fromEntries(taskSnapshots.map((snapshot, index) => [allowedTaskIds[index], snapshot.exists() ? snapshot.val() : null]).filter(([, task]) => task));
+    const grouped = await Promise.all(allowedTaskIds.map(async taskId => {
+      const [comments, approvals, activity, calendarEvents] = await Promise.all([
+        get(ref(database, `${regularWorkCommentsPath}/${taskId}`)),
+        get(ref(database, `${regularWorkApprovalsPath}/${taskId}`)),
+        get(ref(database, `${regularWorkActivityPath}/${taskId}`)),
+        get(ref(database, `${regularWorkCalendarPath}/${taskId}`))
+      ]);
+      return [taskId, {
+        comments: comments.exists() ? comments.val() : {},
+        approvals: approvals.exists() ? approvals.val() : {},
+        activity: activity.exists() ? activity.val() : {},
+        calendarEvents: calendarEvents.exists() ? calendarEvents.val() : {}
+      }];
+    }));
+    stored.comments = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.comments]));
+    stored.approvals = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.approvals]));
+    stored.activity = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.activity]));
+    stored.calendarEvents = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.calendarEvents]));
+  }
+
+  const folders = [];
+  const categories = [];
+  Object.entries(owners).forEach(([ownerUid, data]) => {
+    folders.push(...recordsWithKeys(data?.folders).map(folder => ({ ...folder, ownerUid: folder.ownerUid || ownerUid })));
+    categories.push(...recordsWithKeys(data?.categories).map(category => ({ ...category, ownerUid: category.ownerUid || ownerUid })));
+  });
+  const tasks = recordsWithKeys(stored.tasks).filter(task => allowedTaskIds.includes(task.id)).map(task => ({
+    ...task,
+    contextType: 'regular_work',
+    project: null,
+    workstream: task.regularCategoryName || task.workstream || 'Regular Work',
+    deliverable: task.deliverable || task.regularFolderName || 'Regular Work'
+  }));
+  const data = {
+    folders,
+    categories,
+    tasks,
+    comments: recordsGroupedByTask(stored.comments),
+    approvals: recordsGroupedByTask(stored.approvals),
+    activity: [...recordsGroupedByTask(stored.activity), ...Object.entries(ownerActivity).flatMap(([ownerUid, records]) => recordsWithKeys(records).map(event => ({ ...event, ownerUid, contextType: 'regular_work' })))],
+    ownerActivity: Object.entries(ownerActivity).flatMap(([ownerUid, records]) => recordsWithKeys(records).map(event => ({ ...event, ownerUid, contextType: 'regular_work' }))),
+    calendarEvents: recordsGroupedByTask(stored.calendarEvents)
+  };
+  const approvalsByTask=recordsFrom(data.approvals).reduce((map,approval)=>{(map[approval.task]||(map[approval.task]=[])).push(approval);return map},{});
+  const eventsByTask=recordsFrom(data.calendarEvents).reduce((map,event)=>{const taskId=event.regularWorkTaskId||event.task;if(taskId)(map[taskId]||(map[taskId]=[])).push(event);return map},{});
+  data.access=Object.fromEntries(tasks.map(task=>[task.id,[...new Set([task.folderOwnerUserId,task.createdBy,task.owner,...(approvalsByTask[task.id]||[]).flatMap(approval=>[approval.requestedBy,...(approval.approvers||[])]),...(eventsByTask[task.id]||[]).flatMap(event=>[event.createdBy,...(event.participants||[])])].filter(Boolean))]]));
+  data.tasks.forEach(task=>{task.accessUserIds=data.access[task.id]||[]});
+  lastRegularWorkSnapshot = cloneRegularWorkSnapshot(data);
+  return data;
+}
+
+function mergeRegularWorkIntoState(state, regularWork) {
+  const taskIds = new Set(recordsFrom(regularWork?.tasks).map(task => task.id));
+  state.regularWorkFolders = recordsFrom(regularWork?.folders);
+  state.regularWorkCategories = recordsFrom(regularWork?.categories);
+  state.tasks = [...recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work'), ...recordsFrom(regularWork?.tasks)];
+  state.comments = [...recordsFrom(state.comments).filter(record => !taskIds.has(record.task)), ...recordsFrom(regularWork?.comments)];
+  state.approvals = [...recordsFrom(state.approvals).filter(record => !taskIds.has(record.task)), ...recordsFrom(regularWork?.approvals)];
+  state.activity = [...recordsFrom(state.activity).filter(record => !taskIds.has(record.task)), ...recordsFrom(regularWork?.activity)];
+  state.calendarEvents = [...recordsFrom(state.calendarEvents).filter(record => !taskIds.has(record.task)), ...recordsFrom(regularWork?.calendarEvents)];
+  return state;
+}
+
 async function readEmployeeWorkspace(profile) {
   const [workspaceSnapshot, directorySnapshot] = await Promise.all([
     get(ref(database, workspacePath)),
@@ -533,6 +665,8 @@ async function authorize(user) {
       }
     }
   } else state = await readEmployeeWorkspace(profile);
+  const regularWork = await readRegularWorkData(user.uid, admin, profile);
+  state = mergeRegularWorkIntoState(state || emptyState(), regularWork);
   state = { ...emptyState(), ...(state || {}) };
   if (admin) state = ensureAdminProfile(state, user);
   else {
@@ -628,9 +762,10 @@ async function loadApplication() {
   await loadClassicScript('app.js');
   await loadClassicScript('phase13.js');
   await loadClassicScript('phase15.js');
-  await loadClassicScript('phase16.js');
+  await loadClassicScript('phase19.js');
   await loadClassicScript('phase17.js');
   await loadClassicScript('phase18.js');
+  await loadClassicScript('phase20.js');
   appLoaded = true;
 }
 
@@ -648,6 +783,8 @@ async function handleAuthState(user) {
     stopPrivateWatching = null;
     if (stopManagementWatching) stopManagementWatching();
     stopManagementWatching = null;
+    if (stopRegularWorkWatching) stopRegularWorkWatching();
+    stopRegularWorkWatching = null;
     appDataWritesEnabled = false;
     deferredSaveState = null;
     firebaseAuthState = SIGNED_OUT;
@@ -716,7 +853,7 @@ function startRealtimeSync() {
       polling = true;
       try {
         const incoming = await readEmployeeWorkspace(employeeProfile);
-        const workspace = incoming || emptyState();
+        const workspace = mergeRegularWorkIntoState(incoming || emptyState(), await readRegularWorkData(authUser.uid, false, employeeProfile));
         workspace.users = Array.isArray(workspace.users) ? workspace.users : [];
         const existing = workspace.users.find(account => account.authUid === authUser.uid || account.id === employeeProfile.appUserId);
         const appProfile = { ...(existing || {}), ...appUserFromEmployee(employeeProfile) };
@@ -741,23 +878,28 @@ function startRealtimeSync() {
       } finally { polling = false; }
     };
     const timer = setInterval(refreshScopedState, 15000);
+    const stopTaskAccessWatch = onValue(ref(database, `${regularWorkTaskAccessPath}/${employeeProfile.appUserId}`), refreshScopedState, error => console.error('Could not monitor assigned Regular Work tasks:', error));
+    const stopOwnerWorkWatch = onValue(ref(database, `${regularWorkOwnersPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor owned Regular Work structure:', error));
+    if (stopRegularWorkWatching) stopRegularWorkWatching();
+    stopRegularWorkWatching = () => { stopTaskAccessWatch(); stopOwnerWorkWatch(); };
     stopWatching = () => clearInterval(timer);
     const pending = deferredSaveState;
     deferredSaveState = null;
     if (pending) window.firebaseHub.saveState(pending);
     return;
   }
-  stopWatching = onValue(ref(database, workspacePath), snapshot => {
+  stopWatching = onValue(ref(database, workspacePath), async snapshot => {
     if (!snapshot.exists()) return;
     const mergedOperational = recoveryPending && recoveryContext
       ? mergeData(snapshot.val(), cleanWorkspaceState(recoveryContext.legacy))
       : snapshot.val();
-    const incoming = { ...emptyState(), ...mergedOperational, ...safeDirectory(adminManagement) };
+    let incoming = { ...emptyState(), ...mergedOperational, ...safeDirectory(adminManagement) };
     if (isSystemAdmin()) {
       incoming.users = adminManagement.users || incoming.users;
       incoming.departments = adminManagement.departments || incoming.departments;
       ensureAdminProfile(incoming, authUser);
       Object.assign(incoming, clonePrivateCollections(lastPrivateData));
+      incoming = mergeRegularWorkIntoState(incoming, await readRegularWorkData(authUser.uid, true));
     }
     else return;
     const json = JSON.stringify(cleanWorkspaceState(incoming));
@@ -775,6 +917,7 @@ function startRealtimeSync() {
   if (isSystemAdmin()) {
     startPrivateAdminSync();
     startAdminManagementSync();
+    startRegularWorkAdminSync();
     if (recoveryPending) runSparkMigration();
     else if (recoveryContext?.marker?.status !== 'completed') {
       set(ref(database, migrationMetadataPath), {
@@ -792,6 +935,113 @@ function startRealtimeSync() {
     deferredSaveState = null;
     if (pending) window.firebaseHub.saveState(pending);
   }
+}
+
+function startRegularWorkAdminSync() {
+  if (!isSystemAdmin()) return;
+  if (stopRegularWorkWatching) stopRegularWorkWatching();
+  stopRegularWorkWatching = onValue(ref(database, regularWorkPath), async () => {
+    try {
+      const incoming = mergeRegularWorkIntoState(window.firebaseHub.initialState || emptyState(), await readRegularWorkData(authUser.uid, true));
+      window.firebaseHub.initialState = incoming;
+      if (typeof window.applyFirebaseState === 'function') {
+        window.applyFirebaseState(incoming);
+        window.refreshFirebaseView();
+      }
+    } catch (error) {
+      console.error('Could not refresh Admin Regular Work data:', error);
+      window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
+    }
+  }, error => console.error('Could not monitor Regular Work data:', error));
+}
+
+function regularRecordMap(records, includeTask = false) {
+  return new Map(recordsFrom(records).map(record => [includeTask ? `${record.task || ''}/${record.id}` : record.id, record]));
+}
+
+async function saveRegularRecordCollection(pathForRecord, records, oldRecords, actorUid, { immutable = false } = {}) {
+  const before = regularRecordMap(oldRecords, true);
+  const after = regularRecordMap(records, true);
+  for (const [key, record] of after) {
+    if (JSON.stringify(before.get(key)) === JSON.stringify(record)) continue;
+    if (immutable && before.has(key)) continue;
+    const path = pathForRecord(record);
+    if (!path) continue;
+    const saved = { ...record, ...(record.authorUid ? {} : { authorUid: actorUid }), ...(record.actorUid ? {} : { actorUid: actorUid }), ...(record.createdByUid ? {} : { createdByUid: actorUid }) };
+    await set(ref(database, path), saved);
+  }
+}
+
+function regularWorkDataFromState(state, actorUid, admin) {
+  const tasks = recordsFrom(state.tasks).filter(task => task.contextType === 'regular_work');
+  const taskIds = new Set(tasks.map(task => task.id));
+  const approvals=recordsFrom(state.approvals).filter(approval=>taskIds.has(approval.task)).map(approval=>({...approval,approverIds:Object.fromEntries((approval.approvers||[]).map(id=>[id,true]))}));
+  const events=recordsFrom(state.calendarEvents).filter(event=>event.regularWorkTaskId||taskIds.has(event.task)).map(event=>({...event,participantUserIds:Object.fromEntries((event.participants||[]).map(id=>[id,true]))}));
+  const approvalsByTask=approvals.reduce((map,approval)=>{(map[approval.task]||(map[approval.task]=[])).push(approval);return map},{});
+  const eventsByTask=events.reduce((map,event)=>{const taskId=event.regularWorkTaskId||event.task;if(taskId)(map[taskId]||(map[taskId]=[])).push(event);return map},{});
+  const access=Object.fromEntries(tasks.map(task=>[task.id,[...new Set([task.folderOwnerUserId,task.createdBy,task.owner,...(approvalsByTask[task.id]||[]).flatMap(approval=>[approval.requestedBy,...(approval.approvers||[])]),...(eventsByTask[task.id]||[]).flatMap(event=>[event.createdBy,...(event.participants||[])])].filter(Boolean))]]));
+  tasks.forEach(task=>{task.accessUserIds=access[task.id]||[]});
+  return cloneRegularWorkSnapshot({
+    folders: recordsFrom(state.regularWorkFolders).filter(folder => admin || folder.ownerUid === actorUid),
+    categories: recordsFrom(state.regularWorkCategories).filter(category => admin || category.ownerUid === actorUid),
+    tasks,
+    comments: recordsFrom(state.comments).filter(comment => taskIds.has(comment.task)),
+    approvals,
+    activity: recordsFrom(state.activity).filter(event => event.contextType === 'regular_work' || taskIds.has(event.task)),
+    ownerActivity: recordsFrom(state.activity).filter(event => event.contextType === 'regular_work' && !event.task),
+    calendarEvents: events,
+    access
+  });
+}
+
+async function saveRegularWorkData(state) {
+  const actorUid = auth.currentUser?.uid;
+  if (!actorUid) return;
+  const admin = isSystemAdmin();
+  const next = regularWorkDataFromState(state, actorUid, admin);
+  const previous = lastRegularWorkSnapshot;
+
+  const upsertOwned = async (collection, oldRecords) => {
+    const oldById = new Map(recordsFrom(oldRecords).map(record => [record.id, record]));
+    for (const record of recordsFrom(next[collection])) {
+      const ownerUid = record.ownerUid;
+      if (!ownerUid || (!admin && ownerUid !== actorUid)) continue;
+      if (JSON.stringify(oldById.get(record.id)) === JSON.stringify(record)) continue;
+      await set(ref(database, `${regularWorkOwnersPath}/${ownerUid}/${collection}/${record.id}`), record);
+    }
+  };
+  await upsertOwned('folders', previous.folders);
+  await upsertOwned('categories', previous.categories);
+
+  const oldTasks = regularRecordMap(previous.tasks);
+  const newTasks = regularRecordMap(next.tasks);
+  for (const [taskId, task] of newTasks) {
+    const old = oldTasks.get(taskId);
+    if (JSON.stringify(old) === JSON.stringify(task)) continue;
+    const savedTask = { ...task, createdByUid: task.createdByUid || actorUid };
+    await set(ref(database, `${regularWorkTasksPath}/${taskId}`), savedTask);
+  }
+
+  for (const [taskId, accessUids] of Object.entries(next.access)) {
+    const oldAccessUids=new Set(previous.access?.[taskId]||[]);
+    for(const appUserId of accessUids)if(!oldAccessUids.has(appUserId))await set(ref(database,`${regularWorkTaskAccessPath}/${appUserId}/${taskId}`),true);
+    const task=next.tasks.find(record=>record.id===taskId);
+    if(admin||task?.createdByUid===actorUid||task?.folderOwnerUid===actorUid){
+      const nextAccess=new Set(accessUids);
+      for(const appUserId of oldAccessUids)if(!nextAccess.has(appUserId))await set(ref(database,`${regularWorkTaskAccessPath}/${appUserId}/${taskId}`),null);
+    }
+  }
+
+  await saveRegularRecordCollection(record => `${regularWorkCommentsPath}/${record.task}/${record.id}`, next.comments, previous.comments, actorUid);
+  await saveRegularRecordCollection(record => `${regularWorkApprovalsPath}/${record.task}/${record.id}`, next.approvals, previous.approvals, actorUid);
+  const taskActivity=next.activity.filter(event=>event.task),ownerActivity=next.activity.filter(event=>!event.task&&event.ownerUid);
+  await saveRegularRecordCollection(record => `${regularWorkActivityPath}/${record.task}/${record.id}`, taskActivity, previous.activity.filter(event=>event.task), actorUid, { immutable: true });
+  await saveRegularRecordCollection(record => `${regularWorkOwnerActivityPath}/${record.ownerUid}/${record.id}`, ownerActivity, previous.activity.filter(event=>!event.task&&event.ownerUid), actorUid, { immutable: true });
+  await saveRegularRecordCollection(record => {
+    const taskId = record.regularWorkTaskId || record.task;
+    return taskId && newTasks.has(taskId) ? `${regularWorkCalendarPath}/${taskId}/${record.id}` : null;
+  }, next.calendarEvents, previous.calendarEvents, actorUid);
+  lastRegularWorkSnapshot = next;
 }
 
 function startAdminManagementSync() {
@@ -839,10 +1089,41 @@ window.firebaseHub = {
   initialState: emptyState(),
   employeeProfile: null,
   get authUser() { return authUser; },
+  get firebaseUid() { return auth.currentUser?.uid || ''; },
   get SYSTEM_ADMIN_EMAIL() { return SYSTEM_ADMIN_EMAIL; },
   get adminUid() { return isSystemAdmin() ? auth.currentUser?.uid || '' : ''; },
   get privateDataAvailable() { return privateDataAvailable; },
   isSystemAdmin,
+  canAccessRegularWorkTask(taskId) {
+    if (isSystemAdmin() || lastRegularWorkSnapshot.tasks.some(task => task.id === taskId)) return true;
+    const task = window.getFirebaseApplicationState?.().tasks.find(item => item.id === taskId && item.contextType === 'regular_work');
+    return !!task && !!auth.currentUser?.uid && (task.createdByUid === auth.currentUser.uid || task.folderOwnerUid === auth.currentUser.uid || task.owner === employeeProfile?.appUserId || (task.accessUserIds || []).includes(employeeProfile?.appUserId));
+  },
+  async getRegularWorkDailyTasks(parentTaskId) {
+    if (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId)) throw new Error('You do not have access to this Regular Work task.');
+    const snapshot = await get(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}`));
+    return snapshot.exists() ? recordsWithKeys(snapshot.val()) : [];
+  },
+  async saveRegularWorkDailyTask(parentTaskId, dailyTask) {
+    if (!dailyTask?.id || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId))) throw new Error('You do not have access to save a Daily Task here.');
+    await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
+  },
+  watchRegularWorkDailyTasks(parentTaskIds, callback) {
+    if (typeof callback !== 'function') return () => {};
+    const ids = [...new Set(parentTaskIds || [])];
+    if (isSystemAdmin()) {
+      return onValue(ref(database, regularWorkDailyTasksPath), snapshot => {
+        const all = snapshot.exists() ? snapshot.val() : {};
+        ids.forEach(parentTaskId => callback(parentTaskId, recordsWithKeys(all?.[parentTaskId] || {})));
+      }, error => console.error('Could not monitor Daily Tasks:', error));
+    }
+    const stops = ids
+      .filter(parentTaskId => isSystemAdmin() || window.firebaseHub.canAccessRegularWorkTask(parentTaskId))
+      .map(parentTaskId => onValue(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}`), snapshot => {
+        callback(parentTaskId, snapshot.exists() ? recordsWithKeys(snapshot.val()) : []);
+      }, error => console.error(`Could not monitor Daily Tasks for ${parentTaskId}:`, error)));
+    return () => stops.forEach(stop => stop());
+  },
   friendlyError: friendlyAuthError,
   async createEmployeeAccount(email, password, profile) {
     if (!isSystemAdmin()) throw new Error('Only the System Admin can create employee accounts.');
@@ -917,6 +1198,8 @@ window.firebaseHub = {
     stopPrivateWatching = null;
     if (stopManagementWatching) stopManagementWatching();
     stopManagementWatching = null;
+    if (stopRegularWorkWatching) stopRegularWorkWatching();
+    stopRegularWorkWatching = null;
     await signOut(auth);
   },
   async saveState(state) {
@@ -935,12 +1218,16 @@ window.firebaseHub = {
     const privateSnapshot = clonePrivateCollections(state);
     const privateJson = JSON.stringify(privateSnapshot);
     const admin = isSystemAdmin();
-    if (json === lastStateJson && (!admin || (privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return;
+    const regularSnapshot = regularWorkDataFromState(state, auth.currentUser.uid, admin);
+    const regularJson = JSON.stringify(regularSnapshot);
+    const regularChanged = regularJson !== JSON.stringify(lastRegularWorkSnapshot);
+    if (json === lastStateJson && !regularChanged && (!admin || (privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       if (json !== lastStateJson) {
         await set(ref(database, workspacePath), cleaned);
         lastStateJson = json;
       }
+      if (regularChanged) await saveRegularWorkData(state);
       if (admin && (directoryJson !== JSON.stringify(safeDirectory(adminManagement)) || managementJson !== JSON.stringify(adminManagement))) {
         await Promise.all([
           set(ref(database, employeeDirectoryPath), directory),

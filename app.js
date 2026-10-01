@@ -10,6 +10,8 @@ const seed = {
   activity: [],
   calendarEvents: [],
   plannerRead: {},
+  regularWorkFolders: [],
+  regularWorkCategories: [],
   performanceReviews: [],
   performanceSnapshots: []
 };
@@ -311,7 +313,7 @@ function renderActivity(){
     <div class="section-row" style="margin-top:0"><div><h2>Global audit trail</h2><p>Who changed what, when, and where.</p></div><div class="filters"><select class="select"><option>All People</option>${state.users.map(u=>`<option>${u.name}</option>`).join('')}</select><select class="select"><option>All Change Types</option><option>Deadline</option><option>Status</option><option>Progress</option><option>Review</option></select></div></div>
     <div class="panel"><div class="panel-body"><div class="activity">${state.activity.map(activityItem).join('')}</div></div></div>`;
 }
-function activityItem(a){const t=task(a.task);return `<div class="activity-item">${avatar(a.user)}<div class="activity-copy"><strong>${user(a.user).name}</strong><p>${a.text}${t?` on <button class="task-link" data-task="${t.id}">${t.title}</button>`:''}${a.project?` • ${project(a.project).name}`:''}</p>${a.change?`<div class="change">${a.change}</div>`:''}</div><div class="activity-time">${fmtTime(a.time)}</div></div>`}
+function activityItem(a){const t=task(a.task),source=t?.contextType==='regular_work'?` • Regular Work · ${t.regularFolderName||'Folder'} · ${t.regularCategoryName||t.workstream||''}`:a.project?` • ${project(a.project).name}`:'';return `<div class="activity-item">${avatar(a.user)}<div class="activity-copy"><strong>${user(a.user).name}</strong><p>${a.text}${t?` on <button class="task-link" data-task="${t.id}">${t.title}</button>`:''}${source}</p>${a.change?`<div class="change">${a.change}</div>`:''}</div><div class="activity-time">${fmtTime(a.time)}</div></div>`}
 
 function openTask(id){
   const t=task(id); if(!t)return; const p=project(t.project); const comments=state.comments.filter(c=>c.task===id); const history=state.activity.filter(a=>a.task===id);
