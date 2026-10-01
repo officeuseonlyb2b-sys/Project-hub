@@ -7,7 +7,7 @@
         "$uid": {
           ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || auth.uid === $uid)",
           ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
-          ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val().matches(/^(active|inactive|resigned|suspended)$/) && newData.child('appUserId').isString() && newData.child('appUserId').val().length > 0 && newData.child('email').isString() && newData.child('email').val() !== 'ashish@arpitatravels.com')"
+          ".validate": "!newData.exists() || (newData.child('uid').val() === $uid && newData.child('role').val() === 'employee' && newData.child('status').val().matches(/^(active|inactive|resigned|suspended|exited)$/) && newData.child('appUserId').isString() && newData.child('appUserId').val().length > 0 && newData.child('email').isString() && newData.child('email').val() !== 'ashish@arpitatravels.com')"
         }
       },
       "workspace": {
@@ -15,7 +15,7 @@
           "state": {
             ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (root.child('executionHub/users').child(auth.uid).child('uid').val() === auth.uid && root.child('executionHub/users').child(auth.uid).child('role').val() === 'employee' && root.child('executionHub/users').child(auth.uid).child('status').val() === 'active' && root.child('executionHub/users').child(auth.uid).child('appUserId').isString() && root.child('executionHub/users').child(auth.uid).child('appUserId').val().length > 0))",
             ".write": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (newData.exists() && root.child('executionHub/users').child(auth.uid).child('uid').val() === auth.uid && root.child('executionHub/users').child(auth.uid).child('role').val() === 'employee' && root.child('executionHub/users').child(auth.uid).child('status').val() === 'active' && root.child('executionHub/users').child(auth.uid).child('appUserId').isString() && root.child('executionHub/users').child(auth.uid).child('appUserId').val().length > 0))",
-            ".validate": "!newData.exists() || (!newData.child('users').exists() && !newData.child('departments').exists() && !newData.child('performanceReviews').exists() && !newData.child('performanceSnapshots').exists() && !newData.child('payroll').exists() && !newData.child('salary').exists() && !newData.child('salaryRecords').exists() && !newData.child('overtime').exists() && !newData.child('overtimeRecords').exists() && !newData.child('compensation').exists() && !newData.child('management').exists() && !newData.child('managementPrivate').exists())"
+            ".validate": "!newData.exists() || (!newData.child('users').exists() && !newData.child('departments').exists() && !newData.child('performanceReviews').exists() && !newData.child('performanceSnapshots').exists() && !newData.child('attendance').exists() && !newData.child('attendanceRecords').exists() && !newData.child('leaves').exists() && !newData.child('leaveRecords').exists() && !newData.child('payroll').exists() && !newData.child('salary').exists() && !newData.child('salaryRecords').exists() && !newData.child('overtime').exists() && !newData.child('overtimeRecords').exists() && !newData.child('compensation').exists() && !newData.child('management').exists() && !newData.child('managementPrivate').exists())"
           },
           "directory": {
             ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (root.child('executionHub/users').child(auth.uid).child('uid').val() === auth.uid && root.child('executionHub/users').child(auth.uid).child('role').val() === 'employee' && root.child('executionHub/users').child(auth.uid).child('status').val() === 'active' && root.child('executionHub/users').child(auth.uid).child('appUserId').isString() && root.child('executionHub/users').child(auth.uid).child('appUserId').val().length > 0))",
@@ -36,11 +36,33 @@
           ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
           ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
         },
+        "compensation": {
+          ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+        },
+        "performance": {
+          ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+        },
         "authorization": {
           "$uid": {
             ".read": false,
             ".write": false
           }
+        }
+      },
+      "system": {
+        "migrations": {
+          "sparkMigrationV1": {
+            ".read": "auth != null && (auth.token.email === 'ashish@arpitatravels.com' || (root.child('executionHub/users').child(auth.uid).child('uid').val() === auth.uid && root.child('executionHub/users').child(auth.uid).child('role').val() === 'employee' && root.child('executionHub/users').child(auth.uid).child('status').val() === 'active' && root.child('executionHub/users').child(auth.uid).child('appUserId').isString() && root.child('executionHub/users').child(auth.uid).child('appUserId').val().length > 0))",
+            ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
+          }
+        }
+      },
+      "migrationBackups": {
+        "$backupId": {
+          ".read": "auth != null && auth.token.email === 'ashish@arpitatravels.com'",
+          ".write": "auth != null && auth.token.email === 'ashish@arpitatravels.com'"
         }
       },
       "payroll": {

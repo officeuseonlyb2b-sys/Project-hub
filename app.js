@@ -35,6 +35,7 @@ function normalizeState(data){
   return normalized;
 }
 let state = normalizeState(window.firebaseHub?.initialState);
+window.getFirebaseApplicationState = () => state;
 let activeView = 'dashboard';
 let activeProject = null;
 let activeProjectTab = 'overview';

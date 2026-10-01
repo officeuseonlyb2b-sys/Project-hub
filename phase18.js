@@ -23,6 +23,22 @@
   function logOrg(text,change=''){log(state.currentUser,null,null,'Organisation',text,change)}
   function openOrgModal(title,html){el('modalTitle').textContent=title;el('modalBody').innerHTML=html;el('modalBackdrop').classList.add('open')}
   function closeOrgModal(){el('modalBackdrop').classList.remove('open');el('modalBody').innerHTML=''}
+  function showEmployeeCredentials(email,password){
+    let temporaryPassword=password;
+    openOrgModal('Employee account created successfully.',`<div class="form-stack"><div class="form-help prominent">Share these credentials securely. The temporary password is shown only in this message and is not saved.</div><label class="form-field"><span>Login ID</span><input class="input" value="${esc(email)}" readonly></label><label class="form-field"><span>Temporary Password</span><input class="input" value="${esc(temporaryPassword)}" readonly></label><div class="modal-actions"><button type="button" class="btn btn-ghost" id="copyEmployeeCredentials">Copy Credentials</button><button type="button" class="btn btn-soft" id="closeEmployeeCredentials">Close</button></div></div>`);
+    const clear=()=>{temporaryPassword='';closeOrgModal()};
+    el('closeEmployeeCredentials').onclick=clear;
+    el('closeModal').onclick=clear;
+    el('modalBackdrop').addEventListener('click',event=>{if(event.target===el('modalBackdrop'))clear()},{once:true});
+    el('copyEmployeeCredentials').onclick=async()=>{
+      const content=`Login ID: ${email}\nTemporary Password: ${temporaryPassword}`;
+      try{
+        if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(content);
+        else{const copyField=document.createElement('textarea');copyField.value=content;document.body.appendChild(copyField);copyField.select();const copied=document.execCommand('copy');copyField.remove();if(!copied)throw new Error('Copy command unavailable')}
+        toast('Credentials copied. Share them securely.');
+      }catch{toast('Clipboard access is unavailable. Copy the credentials shown above.')}
+    };
+  }
   function field(label,html,help=''){return `<label class="form-field"><span>${label}</span>${html}${help?`<small>${help}</small>`:''}</label>`}
   function uniqueId(prefix){return `${prefix}${Date.now()}${Math.floor(Math.random()*1000)}`}
 
@@ -130,12 +146,18 @@
       <div class="form-help prominent">Department defines the employee's organisational home and Department Performance. Project access remains separate and is granted only when the employee is selected into a project.</div>
       <div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelOrgModal">Cancel</button>${editing&&linkedAuthUid?'<button type="button" class="btn btn-ghost" id="employeePasswordReset">Send Password Reset</button>':''}<button class="btn btn-soft" type="submit">${editing&&!linkedAuthUid?'Create Login & Save Employee':editing?'Save Employee':'Create Employee & Login'}</button></div>
     </form>`);
+    const employeeStatusSelect=el('employeeForm')?.elements.status;
+    if(employeeStatusSelect&&!employeeStatusSelect.querySelector('option[value="exited"]')){
+      const exitedOption=document.createElement('option');exitedOption.value='exited';exitedOption.textContent='Exited';employeeStatusSelect.append(exitedOption);
+      if(editing&&existing.status==='exited')employeeStatusSelect.value='exited';
+    }
     el('employeeModeNew').onclick=()=>openEmployee(null,presetDepartmentId,'new');
     el('employeeModeExisting').onclick=()=>openEmployee(null,presetDepartmentId,'existing');
     el('cancelOrgModal').onclick=closeOrgModal;
     const reset=el('employeePasswordReset');if(reset)reset.onclick=async()=>{reset.disabled=true;try{await window.firebaseHub.resetPassword(existing.email);toast('Password reset email sent.')}catch(error){toast(window.firebaseHub.friendlyError(error))}finally{reset.disabled=false}};
     el('employeeForm').onsubmit=async e=>{
       e.preventDefault();const form=e.target,submit=form.querySelector('button[type="submit"]'),fd=new FormData(form),email=editing?normalizeEmail(existing.email):normalizeEmail(fd.get('email')),name=String(fd.get('name')||'').trim(),designation=String(fd.get('designation')||'').trim(),departmentId=String(fd.get('department')||''),employeeId=String(fd.get('employeeId')||'').trim(),mobile=String(fd.get('mobile')||'').trim(),status=String(fd.get('status')||'active');
+      let createdCredentials=null;
       if(email===window.firebaseHub.SYSTEM_ADMIN_EMAIL.toLowerCase())return toast('The fixed System Admin account cannot be added as an employee.');
       const duplicate=state.users.find(u=>normalizeEmail(u.email)===email&&(!editing||u.id!==existing.id));if(duplicate)return toast('That login email is already assigned to another employee.');
       const employeeIdKey=employeeId.toLowerCase(),duplicateId=state.users.find(u=>String(u.employeeId||'').trim().toLowerCase()===employeeIdKey&&(!editing||u.id!==existing.id));if(duplicateId)return toast('That Employee ID is already in use.');
@@ -143,21 +165,24 @@
       if(editing){
         const before=`${existing.name} • ${departmentName(existing)} • ${existing.designation||existing.role}`;
         recordEmployeeHistory(existing,departmentId,designation);existing.name=name;existing.employeeId=employeeId;existing.mobile=mobile;existing.phone=mobile;existing.designation=designation;existing.jobRole=String(fd.get('jobRole')||'Team Member').trim();existing.role=designation;existing.departmentId=departmentId;existing.dept=d.name;existing.reportingTo=fd.get('reportingTo')||null;existing.dateJoined=fd.get('dateJoined')||existing.dateJoined||'';existing.initials=initials(existing.name);existing.status=status;existing.active=status==='active';
-        const profile={uid:linkedAuthUid,appUserId:existing.id,employeeId,name,email,mobile,department:d.name,departmentId,designation,jobRole:existing.jobRole,role:'employee',accessRole:'Team Member',reportingTo:existing.reportingTo,joiningDate:existing.dateJoined,status,createdBy:existing.createdBy||window.firebaseHub.SYSTEM_ADMIN_EMAIL,createdAt:existing.createdAt||new Date().toISOString()};
+        const profile={uid:linkedAuthUid,appUserId:existing.id,employeeId,name,email,mobile,department:d.name,departmentId,designation,jobRole:existing.jobRole,role:'employee',accessRole:'Team Member',reportingTo:existing.reportingTo,joiningDate:existing.dateJoined,status,createdBy:window.firebaseHub.adminUid,createdAt:existing.createdAt||new Date().toISOString()};
         try{
           if(linkedAuthUid){existing.authUid=linkedAuthUid;await window.firebaseHub.saveEmployeeProfile(linkedAuthUid,profile)}
-          else{submit.disabled=true;const account=await window.firebaseHub.createEmployeeAccount(email,String(fd.get('password')||''),profile);existing.authUid=account.uid;existing.createdBy=profile.createdBy;submit.disabled=false}
+          else{submit.disabled=true;const temporaryPassword=String(fd.get('password')||''),account=await window.firebaseHub.createEmployeeAccount(email,temporaryPassword,profile);existing.authUid=account.uid;existing.createdBy=profile.createdBy;createdCredentials={email:account.email,password:temporaryPassword};submit.disabled=false}
         }catch(error){submit.disabled=false;toast(window.firebaseHub.friendlyError(error));return}
         logOrg(`updated employee ${existing.name}`,`${before} → ${existing.name} • ${d.name} • ${designation} • ${status}`)
       }else{
         submit.disabled=true;
         try{
-          const id=uniqueId('u'),createdAt=new Date().toISOString(),jobRole=String(fd.get('jobRole')||'Team Member').trim(),profile={appUserId:id,employeeId,name,email,mobile,department:d.name,departmentId,designation,jobRole,role:'employee',accessRole:'Team Member',reportingTo:fd.get('reportingTo')||null,joiningDate:fd.get('dateJoined')||'',status,createdBy:window.firebaseHub.SYSTEM_ADMIN_EMAIL,createdAt};
-          const account=await window.firebaseHub.createEmployeeAccount(email,String(fd.get('password')||''),profile);
+          const id=uniqueId('u'),createdAt=new Date().toISOString(),jobRole=String(fd.get('jobRole')||'Team Member').trim(),profile={appUserId:id,employeeId,name,email,mobile,department:d.name,departmentId,designation,jobRole,role:'employee',accessRole:'Team Member',reportingTo:fd.get('reportingTo')||null,joiningDate:fd.get('dateJoined')||'',status,createdBy:window.firebaseHub.adminUid,createdAt};
+          const temporaryPassword=String(fd.get('password')||''),account=await window.firebaseHub.createEmployeeAccount(email,temporaryPassword,profile);
           const u={id,authUid:account.uid,employeeId,name,email,mobile,phone:mobile,designation,jobRole,role:designation,departmentId,dept:d.name,reportingTo:profile.reportingTo,dateJoined:profile.joiningDate,initials:initials(name),active:status==='active',status,systemRole:'Team Member',accessRole:'Team Member',createdBy:profile.createdBy,createdAt,departmentHistory:[{departmentId,designation,from:profile.joiningDate||today(),to:null}]};state.users.push(u);logOrg(`created employee and Firebase login for ${u.name}`,`${employeeId} • ${d.name} • ${designation} • ${status}`)
+          createdCredentials={email:account.email,password:temporaryPassword};
         }catch(error){submit.disabled=false;toast(window.firebaseHub.friendlyError(error));return}
       }
-      save();closeOrgModal();populateUserSelect();render();toast(editing?'Employee updated.':'Employee and login created.')
+      await save();closeOrgModal();populateUserSelect();render();
+      if(createdCredentials)showEmployeeCredentials(createdCredentials.email,createdCredentials.password);
+      else toast(editing?'Employee updated.':'Employee and login created.');
     }
   }
 
@@ -260,6 +285,7 @@
     const md=el('manageDepartmentDetail');if(md)md.onclick=()=>openDepartment(deptById(orgFocusDept));
     const ae=el('addEmployeeToDepartment');if(ae)ae.onclick=()=>openEmployee(null,orgFocusDept);
     const f=el('employeeDeptFilter'),s=el('employeeStatusFilter');
+    if(s&&!s.querySelector('option[value="exited"]'))s.add(new Option('Exited','exited'));
     function applyEmployeeFilter(){const dept=f?.value||'',status=s?.value||'';document.querySelectorAll('#employeeGrid .employee-card').forEach(card=>{const uid=card.dataset.userId||card.querySelector('.org-edit-employee')?.dataset.user||card.querySelector('.org-performance')?.dataset.user;const u=uid?safeUser(uid):null;const okDept=!dept||u?.departmentId===dept;const currentStatus=u?.status||(u?.active===false?'inactive':'active');const okStatus=!status||currentStatus===status;card.style.display=okDept&&okStatus?'':'none'})}
     if(f)f.onchange=applyEmployeeFilter;if(s)s.onchange=applyEmployeeFilter;
     const np=el('newProjectBtn');if(np)np.onclick=openNewProject18;

@@ -11,7 +11,7 @@ import {
   signInWithEmailAndPassword,
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
-import { get, getDatabase, onValue, ref, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
+import { get, getDatabase, onValue, ref, runTransaction, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
 
 const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
 const AUTH_LOADING = 'AUTH_LOADING';
@@ -33,8 +33,11 @@ const employeeDirectoryPath = 'executionHub/workspace/employeeVisibleData/direct
 const adminManagementPath = 'executionHub/admin/employeeManagement';
 const employeeProfilesPath = 'executionHub/users';
 const privateDataPath = 'executionHub/admin/private';
+const migrationBackupsPath = 'executionHub/migrationBackups';
+const migrationMetadataPath = 'executionHub/system/migrations/sparkMigrationV1';
+const migrationId = 'sparkMigrationV1';
 const workspaceCollections = ['users', 'departments', 'projects', 'tasks', 'approvals', 'approvalHistory', 'comments', 'activity', 'calendarEvents'];
-const privateCollections = ['performanceReviews', 'performanceSnapshots', 'payroll', 'salary', 'salaryRecords', 'overtime', 'overtimeRecords', 'compensation', 'management', 'managementPrivate'];
+const privateCollections = ['performanceReviews', 'performanceSnapshots', 'attendance', 'attendanceRecords', 'leaves', 'leaveRecords', 'payroll', 'salary', 'salaryRecords', 'overtime', 'overtimeRecords', 'compensation', 'management', 'managementPrivate'];
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const database = getDatabase(app);
@@ -52,7 +55,6 @@ let lastStateJson = null;
 let lastPrivateJson = null;
 let lastPrivateData = Object.fromEntries(privateCollections.map(collection => [collection, []]));
 let privateDataAvailable = false;
-let legacyPrivateDataPending = false;
 let saveQueue = Promise.resolve();
 let workspaceRecordKeys = Object.fromEntries(workspaceCollections.map(key => [key, new Map()]));
 let privateRecordKeys = Object.fromEntries(privateCollections.map(key => [key, new Map()]));
@@ -61,6 +63,12 @@ let handlingUid = null;
 let pendingAuthMessage = '';
 let legacyState = null;
 let adminManagement = { users: [], departments: [] };
+let adminPrivateData = {};
+let recoveryContext = null;
+let recoveryPending = false;
+let migrationInProgress = false;
+let appDataWritesEnabled = false;
+let deferredSaveState = null;
 let firebaseAuthState = AUTH_LOADING;
 
 function setFirebaseAuthState(nextState) {
@@ -111,6 +119,7 @@ function cleanState(value) {
     delete account.passwordHash;
     delete account.password;
     delete account.temporaryPassword;
+    delete account.initialPassword;
   });
   return result;
 }
@@ -127,15 +136,61 @@ function safeDirectory(state) {
     .filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase())
     .map(account => {
       const safe = { ...account };
-      ['mobile', 'phone', 'reportingTo', 'dateJoined', 'joiningDate', 'departmentHistory', 'createdBy', 'temporaryPassword', 'password', 'passwordHash', 'authUid', 'firebaseUid', 'uid'].forEach(key => delete safe[key]);
+      ['mobile', 'phone', 'reportingTo', 'dateJoined', 'joiningDate', 'departmentHistory', 'createdBy', 'temporaryPassword', 'initialPassword', 'password', 'passwordHash', 'authUid', 'firebaseUid', 'uid'].forEach(key => delete safe[key]);
       return safe;
     });
   const departments = recordsFrom(state?.departments).map(({ id, name, code, headId, active }) => ({ id, name, code, headId, active }));
-  return { users, departments };
+  return JSON.parse(JSON.stringify({ users, departments }));
 }
 
 function managementRecords(state) {
-  return { users: recordsFrom(state?.users), departments: recordsFrom(state?.departments) };
+  const result = JSON.parse(JSON.stringify({ users: recordsFrom(state?.users), departments: recordsFrom(state?.departments) }));
+  stripLegacyCredentials(result);
+  return result;
+}
+
+function employeeManagementRecord(profile, uid) {
+  return {
+    id: profile.appUserId,
+    authUid: uid,
+    appUserId: profile.appUserId,
+    employeeId: profile.employeeId || '',
+    name: profile.name || profile.email,
+    email: profile.email,
+    mobile: profile.mobile || '',
+    department: profile.department || 'Unassigned',
+    departmentId: profile.departmentId || '',
+    designation: profile.designation || 'Team Member',
+    jobRole: profile.jobRole || 'Team Member',
+    role: profile.designation || 'Team Member',
+    reportingTo: profile.reportingTo || null,
+    dateJoined: profile.joiningDate || '',
+    active: profile.status === 'active',
+    status: profile.status,
+    createdAt: profile.createdAt || new Date().toISOString(),
+    createdBy: profile.createdBy || auth.currentUser?.uid || ''
+  };
+}
+
+async function upsertArrayRecord(path, record, { rejectUidConflict = false, rejectExistingId = false } = {}) {
+  const result = await runTransaction(ref(database, path), current => {
+    const records = recordsFrom(current);
+    const index = records.findIndex(item => item.id === record.id || item.appUserId === record.appUserId);
+    if (index >= 0 && rejectExistingId) return;
+    if (index >= 0 && rejectUidConflict && records[index].authUid && records[index].authUid !== record.authUid) return;
+    if (index >= 0) records[index] = { ...records[index], ...record };
+    else records.push(record);
+    return records;
+  }, { applyLocally: false });
+  if (!result.committed) throw new Error(`Could not safely save the employee record at ${path}.`);
+}
+
+async function removeNewEmployeeRecord(path, uid, profile) {
+  await runTransaction(ref(database, path), current => recordsFrom(current).filter(record => {
+    const uidMatches = record.authUid === uid;
+    const newRowMatches = record.id === profile.appUserId && record.email === profile.email && record.createdAt === profile.createdAt;
+    return !uidMatches && !newRowMatches;
+  }), { applyLocally: false });
 }
 
 function recordsFrom(value) {
@@ -154,6 +209,12 @@ function databaseRecordKey(id) {
 
 function privateCollectionsSnapshot(value) {
   return Object.fromEntries(privateCollections.map(collection => [collection, recordsFrom(value?.[collection])]));
+}
+
+function presentPrivateCollections(value) {
+  return Object.fromEntries(privateCollections
+    .filter(collection => value?.[collection] !== undefined && value?.[collection] !== null)
+    .map(collection => [collection, value[collection]]));
 }
 
 function clonePrivateCollections(value) {
@@ -184,53 +245,96 @@ function normalizeWorkspace(value) {
 }
 
 function mergeRecordsById(primary, legacy) {
-  const merged = new Map(recordsFrom(primary).map((record, index) => [recordIdentity(record, index), record]));
-  recordsFrom(legacy).forEach((record, index) => {
-    const id = recordIdentity(record, index);
+  const identity = record => record?.id != null ? `id:${record.id}` : `record:${JSON.stringify(record)}`;
+  const merged = new Map(recordsFrom(primary).map(record => [identity(record), record]));
+  recordsFrom(legacy).forEach(record => {
+    const id = identity(record);
     if (!merged.has(id)) merged.set(id, record);
   });
   return [...merged.values()];
 }
 
+function mergeData(target, source) {
+  if (Array.isArray(target) && Array.isArray(source)) return mergeRecordsById(target, source);
+  if (target && source && typeof target === 'object' && typeof source === 'object' && !Array.isArray(target) && !Array.isArray(source)) {
+    const merged = { ...source, ...target };
+    Object.keys(source).forEach(key => {
+      if (Object.hasOwn(target, key)) merged[key] = mergeData(target[key], source[key]);
+    });
+    return merged;
+  }
+  return target === undefined || target === null ? source : target;
+}
+
+function hasData(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (!value || typeof value !== 'object') return false;
+  return Object.values(value).some(hasData);
+}
+
 function stripLegacyCredentials(value) {
   if (Array.isArray(value)) { value.forEach(stripLegacyCredentials); return; }
   if (!value || typeof value !== 'object') return;
-  ['passwordHash', 'password', 'temporaryPassword'].forEach(key => delete value[key]);
+  ['passwordHash', 'password', 'temporaryPassword', 'initialPassword'].forEach(key => delete value[key]);
   Object.values(value).forEach(stripLegacyCredentials);
 }
-function containsLegacyCredentials(value) {
-  if (Array.isArray(value)) return value.some(containsLegacyCredentials);
-  if (!value || typeof value !== 'object') return false;
-  return Object.keys(value).some(key => ['passwordHash', 'password', 'temporaryPassword'].includes(key) || containsLegacyCredentials(value[key]));
-}
-
 async function readWorkspace() {
-  const [workspaceSnapshot, directorySnapshot, managementSnapshot] = await Promise.all([
+  const [legacySnapshot, workspaceSnapshot, directorySnapshot, managementSnapshot, privateSnapshot, profilesSnapshot, migrationSnapshot] = await Promise.all([
+    get(ref(database, legacyWorkspacePath)),
     get(ref(database, workspacePath)),
     get(ref(database, employeeDirectoryPath)),
-    get(ref(database, adminManagementPath))
+    get(ref(database, adminManagementPath)),
+    get(ref(database, privateDataPath)),
+    get(ref(database, employeeProfilesPath)),
+    get(ref(database, migrationMetadataPath))
   ]);
-  let value = workspaceSnapshot.exists() ? workspaceSnapshot.val() : null;
-  if (!value) {
-    const legacySnapshot = await get(ref(database, legacyWorkspacePath));
-    if (legacySnapshot.exists()) {
-      value = normalizeWorkspace(legacySnapshot.val());
-      stripLegacyCredentials(value);
-      const directory = safeDirectory(value);
-      adminManagement = managementRecords(value);
-      await Promise.all([
-        set(ref(database, workspacePath), cleanWorkspaceState(value)),
-        set(ref(database, employeeDirectoryPath), directory),
-        set(ref(database, adminManagementPath), adminManagement)
-      ]);
-    }
-  }
-  const storedManagement = managementSnapshot.exists() ? managementSnapshot.val() : adminManagement;
-  if (storedManagement && (storedManagement.users || storedManagement.departments)) adminManagement = storedManagement;
-  const directory = directorySnapshot.exists() ? directorySnapshot.val() : safeDirectory(value || {});
-  value = { ...(value || emptyState()), ...(directory || {}), users: adminManagement.users || [], departments: adminManagement.departments || [] };
-  captureRecordKeys(value, workspaceCollections, workspaceRecordKeys);
-  return normalizeWorkspace(value);
+  const legacy = cloneWithoutCredentials(legacySnapshot.exists() ? legacySnapshot.val() : {});
+  const target = cloneWithoutCredentials(workspaceSnapshot.exists() ? workspaceSnapshot.val() : {});
+  const storedManagement = cloneWithoutCredentials(managementSnapshot.exists() ? managementSnapshot.val() : { users: [], departments: [] });
+  const rawProfiles = cloneWithoutCredentials(profilesSnapshot.exists() ? profilesSnapshot.val() : {});
+  const profiles = Object.entries(rawProfiles || {}).map(([uid, profile]) => ({ ...profile, uid }));
+  const users = mergeRecordsById(storedManagement.users, legacy.users).map(account => {
+    const profile = profiles.find(item => item.appUserId === account.id || item.appUserId === account.appUserId || item.uid === account.authUid);
+    return profile
+      ? { ...account, ...appUserFromEmployee(profile), authUid: profile.uid, status: profile.status, active: profile.status === 'active' }
+      : account;
+  });
+  profiles.forEach(profile => {
+    if (!users.some(account => account.authUid === profile.uid || account.id === profile.appUserId)) users.push(appUserFromEmployee(profile));
+  });
+  const departments = mergeRecordsById(storedManagement.departments, legacy.departments);
+  adminManagement = { ...storedManagement, users, departments };
+
+  const storedDirectory = cloneWithoutCredentials(directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] });
+  const directory = safeDirectory(mergeData({ users, departments }, storedDirectory));
+  const operationalLegacy = cleanWorkspaceState(legacy);
+  const operational = cleanWorkspaceState(mergeData(target, operationalLegacy));
+
+  const storedPrivate = cloneWithoutCredentials(privateSnapshot.exists() ? privateSnapshot.val() : {});
+  const legacyPrivate = presentPrivateCollections(legacy);
+  adminPrivateData = mergeData(storedPrivate, legacyPrivate);
+  lastPrivateData = clonePrivateCollections(adminPrivateData);
+  lastPrivateJson = JSON.stringify(lastPrivateData);
+  captureRecordKeys(adminPrivateData, privateCollections, privateRecordKeys);
+  privateDataAvailable = true;
+
+  const marker = migrationSnapshot.exists() ? migrationSnapshot.val() : null;
+  const missingLegacyData = JSON.stringify(operational) !== JSON.stringify(cleanWorkspaceState(target))
+    || JSON.stringify(adminManagement) !== JSON.stringify(storedManagement)
+    || JSON.stringify(directory) !== JSON.stringify(storedDirectory)
+    || JSON.stringify(adminPrivateData) !== JSON.stringify(storedPrivate);
+  recoveryPending = hasData(legacy) && (missingLegacyData || marker?.status !== 'completed');
+  recoveryContext = { legacy, target, storedDirectory, storedManagement, storedPrivate, profiles: rawProfiles, marker };
+
+  const state = normalizeWorkspace({
+    ...operational,
+    ...directory,
+    users,
+    departments,
+    ...privateCollectionsSnapshot(adminPrivateData)
+  });
+  captureRecordKeys(state, workspaceCollections, workspaceRecordKeys);
+  return state;
 }
 
 async function readEmployeeWorkspace(profile) {
@@ -247,50 +351,6 @@ async function readEmployeeWorkspace(profile) {
   if (index < 0) state.users.push(own);
   else state.users[index] = { ...state.users[index], ...own };
   return normalizeWorkspace(state);
-}
-
-async function loadPrivateAdminData(state) {
-  const [snapshot, legacySnapshot] = await Promise.all([
-    get(ref(database, privateDataPath)),
-    get(ref(database, legacyWorkspacePath))
-  ]);
-  const stored = snapshot.exists() ? snapshot.val() : {};
-  const legacyStateValue = legacySnapshot.exists() ? legacySnapshot.val() : {};
-  const migration = {};
-  const privateData = { ...stored };
-
-  privateCollections.forEach(collection => {
-    const legacy = mergeRecordsById(state[collection], legacyStateValue[collection]);
-    const storedCollection = stored[collection] || {};
-    const collectionData = Array.isArray(storedCollection)
-      ? Object.fromEntries(storedCollection.map((record, index) => [String(index), record]))
-      : { ...storedCollection };
-    const storedIds = new Set(recordsFrom(storedCollection).map(recordIdentity));
-    const merged = mergeRecordsById(storedCollection, legacy);
-
-    if (recordsFrom(legacy).length) {
-      recordsFrom(legacy).forEach((record, index) => {
-        const id = recordIdentity(record, index);
-        if (storedIds.has(id)) return;
-        const key = databaseRecordKey(id);
-        migration[`${privateDataPath}/${collection}/${key}`] = record;
-        collectionData[key] = record;
-        storedIds.add(id);
-      });
-      migration[`${workspacePath}/${collection}`] = null;
-    }
-
-    privateData[collection] = collectionData;
-    state[collection] = merged;
-  });
-
-  if (Object.keys(migration).length) await update(ref(database), migration);
-  captureRecordKeys(privateData, privateCollections, privateRecordKeys);
-  lastPrivateData = clonePrivateCollections(privateData);
-  lastPrivateJson = JSON.stringify(lastPrivateData);
-  privateCollections.forEach(collection => { state[collection] = [...lastPrivateData[collection]]; });
-  privateDataAvailable = true;
-  legacyPrivateDataPending = false;
 }
 
 function appUserFromEmployee(profile) {
@@ -333,6 +393,93 @@ function ensureAdminProfile(state, user) {
   return state;
 }
 
+function cloneWithoutCredentials(value) {
+  const copy = value == null ? value : JSON.parse(JSON.stringify(value));
+  stripLegacyCredentials(copy);
+  return copy;
+}
+
+async function runSparkMigration() {
+  if (!isSystemAdmin() || !recoveryPending || !recoveryContext || migrationInProgress) return;
+  migrationInProgress = true;
+  let backupPath = '';
+  try {
+    const context = recoveryContext;
+    const backupsSnapshot = await get(ref(database, migrationBackupsPath));
+    const backups = backupsSnapshot.exists() ? backupsSnapshot.val() : {};
+    let backupEntry = Object.entries(backups).find(([, value]) => value?.migrationId === migrationId);
+    if (!backupEntry) {
+      const backupKey = String(Date.now());
+      backupPath = `${migrationBackupsPath}/${backupKey}`;
+      const backup = {
+        migrationId,
+        createdAt: new Date().toISOString(),
+        sourcePath: legacyWorkspacePath,
+        targetPath: workspacePath,
+        source: cloneWithoutCredentials(context.legacy),
+        ...(context.localState ? { localState: cloneWithoutCredentials(context.localState) } : {}),
+        target: cloneWithoutCredentials(context.target),
+        directory: cloneWithoutCredentials(context.storedDirectory),
+        employeeManagement: cloneWithoutCredentials(context.storedManagement),
+        privateData: cloneWithoutCredentials(context.storedPrivate),
+        employeeProfiles: cloneWithoutCredentials(context.profiles)
+      };
+      await set(ref(database, backupPath), backup);
+      backupEntry = [backupKey, backup];
+    }
+    if (!backupPath) backupPath = `${migrationBackupsPath}/${backupEntry[0]}`;
+
+    await set(ref(database, migrationMetadataPath), {
+      migrationId,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      sourcePath: legacyWorkspacePath,
+      targetPath: workspacePath,
+      backupPath
+    });
+
+    const source = mergeData(context.legacy, context.localState || {});
+    const operational = cleanWorkspaceState(mergeData(context.target, cleanWorkspaceState(source)));
+    const management = mergeData(context.storedManagement, mergeData(adminManagement, managementRecords(source)));
+    const directory = safeDirectory(mergeData(management, context.storedDirectory));
+    const privateSource = presentPrivateCollections(source);
+    const privateData = mergeData(context.storedPrivate, mergeData(adminPrivateData, privateSource));
+    const updates = {
+      [workspacePath]: operational,
+      [employeeDirectoryPath]: directory,
+      [adminManagementPath]: management
+    };
+    if (Object.keys(privateData).length) updates[privateDataPath] = privateData;
+    await update(ref(database), updates);
+    await set(ref(database, migrationMetadataPath), {
+      migrationId,
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      sourcePath: legacyWorkspacePath,
+      targetPath: workspacePath,
+      backupPath
+    });
+
+    recoveryPending = false;
+    lastStateJson = JSON.stringify(operational);
+    adminManagement = management;
+    adminPrivateData = privateData;
+    lastPrivateData = clonePrivateCollections(privateData);
+    lastPrivateJson = JSON.stringify(lastPrivateData);
+    captureRecordKeys(privateData, privateCollections, privateRecordKeys);
+    localStorage.removeItem('executionHubStateFinal');
+    if (typeof window.getFirebaseApplicationState === 'function') {
+      deferredSaveState = null;
+      await window.firebaseHub.saveState(window.getFirebaseApplicationState());
+    }
+  } catch (error) {
+    console.error('Legacy data recovery did not complete; the original legacy data and backup were left untouched:', error);
+    window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
+  } finally {
+    migrationInProgress = false;
+  }
+}
+
 async function authorize(user) {
   if (!user?.email) throw new Error('Your Firebase account does not have an email address.');
   systemAdminUid = null;
@@ -345,56 +492,50 @@ async function authorize(user) {
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${user.uid}`));
     profile = snapshot.exists() ? snapshot.val() : null;
     if (!profile || profile.uid !== user.uid || profile.email?.toLowerCase() !== user.email.toLowerCase() || profile.role !== 'employee') {
-      throw Object.assign(new Error('Your account is not authorized for this application. Please contact the administrator.'), { code: 'app/not-authorized' });
+      throw Object.assign(new Error('Your account exists but is not authorized for this application. Please contact the administrator.'), { code: 'app/not-authorized' });
     }
     if (profile.status !== 'active') {
       const messages = {
         inactive: 'Your account is inactive. Please contact the administrator.',
         resigned: 'Your account is marked as resigned. Please contact the administrator.',
-        suspended: 'Your account is suspended. Please contact the administrator.'
+        suspended: 'Your account is suspended. Please contact the administrator.',
+        exited: 'Your account is marked as exited. Please contact the administrator.'
       };
       throw Object.assign(new Error(messages[profile.status] || 'Your account is disabled. Please contact the administrator.'), { code: 'app/account-disabled' });
     }
-    if (!profile.appUserId) throw Object.assign(new Error('Your employee profile is incomplete. Please contact the administrator.'), { code: 'app/not-authorized' });
+    if (typeof profile.appUserId !== 'string' || !profile.appUserId.trim()) throw Object.assign(new Error('Your employee profile is incomplete. Please contact the administrator.'), { code: 'app/not-authorized' });
+    const migrationSnapshot = await get(ref(database, migrationMetadataPath));
+    if (migrationSnapshot.val()?.status !== 'completed') {
+      throw Object.assign(new Error('The administrator must complete workspace data recovery before employee access is enabled.'), { code: 'app/migration-pending' });
+    }
   }
 
   let state;
-  let scrubCloudCredentials = false;
-  let restoredLocalState = false;
   if (admin) {
     state = await readWorkspace();
-    scrubCloudCredentials = containsLegacyCredentials(state);
-    if (state) stripLegacyCredentials(state);
-    const hasCloudRecords = state && ['users', 'departments', 'projects', 'tasks', 'approvals', 'comments', 'activity', 'calendarEvents'].some(key => Array.isArray(state[key]) && state[key].length);
-    if (!hasCloudRecords && legacyState) {
-      state = legacyState;
-      legacyState = null;
-      restoredLocalState = true;
+    if (hasData(legacyState)) {
+      const localState = cloneWithoutCredentials(legacyState);
+      const mergedState = normalizeWorkspace(mergeData(state, localState));
+      const mergedManagement = mergeData(adminManagement, managementRecords(localState));
+      const mergedPrivate = mergeData(adminPrivateData, presentPrivateCollections(localState));
+      const localDataMissing = JSON.stringify(cleanWorkspaceState(mergedState)) !== JSON.stringify(cleanWorkspaceState(state))
+        || JSON.stringify(mergedManagement) !== JSON.stringify(adminManagement)
+        || JSON.stringify(mergedPrivate) !== JSON.stringify(adminPrivateData);
+      if (localDataMissing) {
+        state = mergedState;
+        recoveryContext = { ...(recoveryContext || {}), localState };
+        recoveryPending = true;
+        adminManagement = mergedManagement;
+        adminPrivateData = mergedPrivate;
+      } else {
+        localStorage.removeItem('executionHubStateFinal');
+        legacyState = null;
+      }
     }
   } else state = await readEmployeeWorkspace(profile);
   state = { ...emptyState(), ...(state || {}) };
-  if (admin) {
-    try {
-      await loadPrivateAdminData(state);
-    } catch (error) {
-      if (!isDatabasePermissionDenied(error)) throw error;
-      legacyPrivateDataPending = privateCollections.some(collection => recordsFrom(state[collection]).length > 0);
-      privateDataAvailable = false;
-      lastPrivateData = Object.fromEntries(privateCollections.map(collection => [collection, []]));
-      lastPrivateJson = JSON.stringify(lastPrivateData);
-      privateCollections.forEach(collection => { state[collection] = []; });
-      console.warn('Private management data is unavailable until Realtime Database rules grant System Admin access.');
-    }
-  } else privateCollections.forEach(collection => { state[collection] = []; });
-  if (admin) {
-    state = ensureAdminProfile(state, user);
-    if (scrubCloudCredentials && !legacyPrivateDataPending) {
-      await set(ref(database, workspacePath), cleanWorkspaceState(state));
-      await set(ref(database, employeeDirectoryPath), safeDirectory(state));
-      adminManagement = managementRecords(state);
-      await set(ref(database, adminManagementPath), adminManagement);
-    }
-  } else {
+  if (admin) state = ensureAdminProfile(state, user);
+  else {
     state.users = Array.isArray(state.users) ? state.users : [];
     const existing = state.users.find(account => account.authUid === user.uid || account.id === profile.appUserId);
     const appProfile = { ...(existing || {}), ...appUserFromEmployee(profile) };
@@ -406,7 +547,7 @@ async function authorize(user) {
   employeeProfile = profile;
   window.firebaseHub.initialState = state;
   window.firebaseHub.employeeProfile = profile;
-  lastStateJson = restoredLocalState ? null : JSON.stringify(cleanWorkspaceState(state));
+  lastStateJson = JSON.stringify(cleanWorkspaceState(state));
   return { state, admin, profile };
 }
 
@@ -431,12 +572,6 @@ function friendlyAuthError(error) {
   if (code === 'auth/operation-not-allowed') return 'Email and password sign-in is not enabled in Firebase Console.';
   if (code === 'PERMISSION_DENIED' || error?.message?.includes('PERMISSION_DENIED')) return 'Firebase denied access. Check the deployed Realtime Database rules.';
   return error?.message || 'Unable to complete the Firebase request. Please try again.';
-}
-
-function isDatabasePermissionDenied(error) {
-  return error?.code === 'PERMISSION_DENIED'
-    || error?.code === 'database/permission-denied'
-    || /permission denied/i.test(error?.message || '');
 }
 
 function showLogin(message = '') {
@@ -513,6 +648,8 @@ async function handleAuthState(user) {
     stopPrivateWatching = null;
     if (stopManagementWatching) stopManagementWatching();
     stopManagementWatching = null;
+    appDataWritesEnabled = false;
+    deferredSaveState = null;
     firebaseAuthState = SIGNED_OUT;
     showLogin(pendingAuthMessage);
     pendingAuthMessage = '';
@@ -555,6 +692,7 @@ async function handleAuthState(user) {
 
 function startRealtimeSync() {
   if (stopWatching || !authUser) return;
+  appDataWritesEnabled = true;
   if (!isSystemAdmin()) {
     if (stopProfileWatch) stopProfileWatch();
     stopProfileWatch = onValue(ref(database, `${employeeProfilesPath}/${authUser.uid}`), snapshot => {
@@ -562,10 +700,11 @@ function startRealtimeSync() {
       if (!profile || profile.uid !== authUser.uid || profile.role !== 'employee' || profile.status !== 'active' || !profile.appUserId) {
         const disabled = profile?.status && profile.status !== 'active';
         pendingAuthMessage = disabled
-          ? ({ inactive: 'Your account is inactive. Please contact the administrator.', resigned: 'Your account is marked as resigned. Please contact the administrator.', suspended: 'Your account is suspended. Please contact the administrator.' }[profile.status] || 'Your account is disabled. Please contact the administrator.')
+          ? ({ inactive: 'Your account is inactive. Please contact the administrator.', resigned: 'Your account is marked as resigned. Please contact the administrator.', suspended: 'Your account is suspended. Please contact the administrator.', exited: 'Your account is marked as exited. Please contact the administrator.' }[profile.status] || 'Your account is disabled. Please contact the administrator.')
           : 'Your account is not authorized for this application. Please contact the administrator.';
         firebaseAuthState = SIGNED_OUT;
         showLogin(pendingAuthMessage);
+        signOut(auth).catch(() => {});
         return;
       }
       employeeProfile = profile;
@@ -597,16 +736,23 @@ function startRealtimeSync() {
           pendingAuthMessage = error.message || 'Your account is not authorized for this application. Please contact the administrator.';
           firebaseAuthState = SIGNED_OUT;
           showLogin(pendingAuthMessage);
+          signOut(auth).catch(() => {});
         }
       } finally { polling = false; }
     };
     const timer = setInterval(refreshScopedState, 15000);
     stopWatching = () => clearInterval(timer);
+    const pending = deferredSaveState;
+    deferredSaveState = null;
+    if (pending) window.firebaseHub.saveState(pending);
     return;
   }
   stopWatching = onValue(ref(database, workspacePath), snapshot => {
     if (!snapshot.exists()) return;
-    const incoming = { ...emptyState(), ...snapshot.val(), ...safeDirectory(adminManagement) };
+    const mergedOperational = recoveryPending && recoveryContext
+      ? mergeData(snapshot.val(), cleanWorkspaceState(recoveryContext.legacy))
+      : snapshot.val();
+    const incoming = { ...emptyState(), ...mergedOperational, ...safeDirectory(adminManagement) };
     if (isSystemAdmin()) {
       incoming.users = adminManagement.users || incoming.users;
       incoming.departments = adminManagement.departments || incoming.departments;
@@ -629,6 +775,22 @@ function startRealtimeSync() {
   if (isSystemAdmin()) {
     startPrivateAdminSync();
     startAdminManagementSync();
+    if (recoveryPending) runSparkMigration();
+    else if (recoveryContext?.marker?.status !== 'completed') {
+      set(ref(database, migrationMetadataPath), {
+        migrationId,
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        sourcePath: legacyWorkspacePath,
+        targetPath: workspacePath,
+        backupPath: null
+      }).catch(error => console.error('Could not record that no legacy recovery was required:', error));
+    }
+  }
+  if (!isSystemAdmin() || !recoveryPending) {
+    const pending = deferredSaveState;
+    deferredSaveState = null;
+    if (pending) window.firebaseHub.saveState(pending);
   }
 }
 
@@ -636,7 +798,8 @@ function startAdminManagementSync() {
   if (!isSystemAdmin()) return;
   if (stopManagementWatching) stopManagementWatching();
   stopManagementWatching = onValue(ref(database, adminManagementPath), snapshot => {
-    adminManagement = snapshot.exists() ? snapshot.val() : { users: [], departments: [] };
+    const stored = snapshot.exists() ? snapshot.val() : { users: [], departments: [] };
+    adminManagement = recoveryPending ? mergeData(adminManagement, stored) : stored;
     const incoming = { ...(window.firebaseHub.initialState || emptyState()), users: adminManagement.users || [], departments: adminManagement.departments || [] };
     window.firebaseHub.initialState = incoming;
     if (typeof window.applyFirebaseState === 'function') {
@@ -650,13 +813,14 @@ function startPrivateAdminSync() {
   if (stopPrivateWatching || !isSystemAdmin() || !privateDataAvailable) return;
   stopPrivateWatching = onValue(ref(database, privateDataPath), snapshot => {
     const stored = snapshot.exists() ? snapshot.val() : {};
-    const next = privateCollectionsSnapshot(stored);
+    adminPrivateData = recoveryPending ? mergeData(adminPrivateData, stored) : stored;
+    const next = privateCollectionsSnapshot(adminPrivateData);
     const json = JSON.stringify(next);
     if (json === lastPrivateJson) return;
     lastPrivateJson = json;
     lastPrivateData = clonePrivateCollections(next);
     privateDataAvailable = true;
-    captureRecordKeys(stored, privateCollections, privateRecordKeys);
+    captureRecordKeys(adminPrivateData, privateCollections, privateRecordKeys);
     const combined = { ...(window.firebaseHub.initialState || emptyState()), ...lastPrivateData };
     window.firebaseHub.initialState = combined;
     if (typeof window.applyFirebaseState === 'function') {
@@ -676,35 +840,72 @@ window.firebaseHub = {
   employeeProfile: null,
   get authUser() { return authUser; },
   get SYSTEM_ADMIN_EMAIL() { return SYSTEM_ADMIN_EMAIL; },
+  get adminUid() { return isSystemAdmin() ? auth.currentUser?.uid || '' : ''; },
   get privateDataAvailable() { return privateDataAvailable; },
   isSystemAdmin,
   friendlyError: friendlyAuthError,
   async createEmployeeAccount(email, password, profile) {
+    if (!isSystemAdmin()) throw new Error('Only the System Admin can create employee accounts.');
+    if (recoveryPending) throw new Error('Workspace recovery is still running. Please retry employee creation in a moment.');
     let credential;
+    let rollbackError = null;
     try {
       credential = await createUserWithEmailAndPassword(employeeCreationAuth, email, password);
       const uid = credential.user.uid;
-      const savedProfile = { ...profile, uid, email: credential.user.email, role: 'employee' };
+      const savedProfile = {
+        ...profile,
+        uid,
+        email: credential.user.email,
+        role: 'employee',
+        createdBy: profile.createdBy || auth.currentUser.uid
+      };
+      delete savedProfile.password;
+      delete savedProfile.temporaryPassword;
+      delete savedProfile.initialPassword;
       await set(ref(database, `${employeeProfilesPath}/${uid}`), savedProfile);
-      await signOut(employeeCreationAuth);
-      return { ...credential.user, uid };
+      const record = employeeManagementRecord(savedProfile, uid);
+      await upsertArrayRecord(`${adminManagementPath}/users`, record, { rejectUidConflict: true, rejectExistingId: true });
+      await upsertArrayRecord(`${employeeDirectoryPath}/users`, safeDirectory({ users: [record] }).users[0], { rejectExistingId: true });
+      return { uid, email: credential.user.email };
     } catch (error) {
-      if (credential?.user) await deleteUser(credential.user).catch(() => {});
+      if (credential?.user) {
+        await removeNewEmployeeRecord(`${employeeDirectoryPath}/users`, credential.user.uid, profile).catch(caught => { rollbackError ||= caught; });
+        await removeNewEmployeeRecord(`${adminManagementPath}/users`, credential.user.uid, profile).catch(caught => { rollbackError ||= caught; });
+        await set(ref(database, `${employeeProfilesPath}/${credential.user.uid}`), null).catch(caught => { rollbackError ||= caught; });
+        await deleteUser(credential.user).catch(caught => { rollbackError ||= caught; });
+      }
+      const explanation = rollbackError
+        ? ` Employee account creation failed and automatic cleanup was incomplete (${rollbackError.message}). Please inspect Firebase Authentication and executionHub/users before retrying.`
+        : ' The new Firebase account was rolled back; no existing employee account was changed.';
+      throw new Error(`${error?.message || 'Employee account creation failed.'}${credential?.user ? explanation : ''}`);
+    } finally {
       await signOut(employeeCreationAuth).catch(() => {});
-      throw error;
     }
   },
   async saveEmployeeProfile(uid, profile) {
     if (!isSystemAdmin()) throw new Error('Only the system administrator may update employee profiles.');
+    if (recoveryPending) throw new Error('Workspace recovery is still running. Please retry in a moment.');
     if (!uid || uid === auth.currentUser?.uid || profile.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()) throw new Error('The System Admin account cannot be edited as an employee.');
-    await set(ref(database, `${employeeProfilesPath}/${uid}`), { ...profile, uid, role: 'employee' });
+    const savedProfile = { ...profile, uid, role: 'employee', createdBy: profile.createdBy || auth.currentUser.uid };
+    delete savedProfile.password;
+    delete savedProfile.temporaryPassword;
+    delete savedProfile.initialPassword;
+    await set(ref(database, `${employeeProfilesPath}/${uid}`), savedProfile);
+    const record = employeeManagementRecord(savedProfile, uid);
+    await upsertArrayRecord(`${adminManagementPath}/users`, record);
+    await upsertArrayRecord(`${employeeDirectoryPath}/users`, safeDirectory({ users: [record] }).users[0]);
   },
   async updateEmployeeStatus(uid, status) {
     if (!isSystemAdmin()) throw new Error('Only the system administrator may update employee status.');
+    if (recoveryPending) throw new Error('Workspace recovery is still running. Please retry in a moment.');
     if (!uid || uid === auth.currentUser?.uid) throw new Error('The System Admin account cannot be deactivated.');
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${uid}`));
     if (!snapshot.exists()) throw new Error('The Firebase employee profile was not found.');
-    await set(ref(database, `${employeeProfilesPath}/${uid}`), { ...snapshot.val(), status, uid, role: 'employee' });
+    const profile = { ...snapshot.val(), status, uid, role: 'employee' };
+    await set(ref(database, `${employeeProfilesPath}/${uid}`), profile);
+    const record = employeeManagementRecord(profile, uid);
+    await upsertArrayRecord(`${adminManagementPath}/users`, record);
+    await upsertArrayRecord(`${employeeDirectoryPath}/users`, safeDirectory({ users: [record] }).users[0]);
   },
   async resetPassword(email) { return sendPasswordResetEmail(auth, email); },
   async signOut() {
@@ -720,8 +921,9 @@ window.firebaseHub = {
   },
   async saveState(state) {
     if (!auth.currentUser) return;
-    if (isSystemAdmin() && !privateDataAvailable && legacyPrivateDataPending) {
-      console.warn('Workspace save skipped to preserve legacy private management data until Admin database rules are available.');
+    if (!appDataWritesEnabled || (isSystemAdmin() && recoveryPending)) {
+      deferredSaveState = state;
+      console.warn('Workspace save deferred until the legacy-data backup and recovery completes.');
       return;
     }
     const cleaned = cleanWorkspaceState(state);
@@ -805,7 +1007,6 @@ try {
     stripLegacyCredentials(savedState);
     legacyState = savedState;
   }
-  localStorage.removeItem('executionHubStateFinal');
   sessionStorage.removeItem('executionHubSessionFinal');
   setFirebaseAuthState(AUTH_LOADING);
   await setPersistence(auth, browserLocalPersistence);
