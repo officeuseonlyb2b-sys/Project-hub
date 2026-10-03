@@ -248,7 +248,8 @@
       }).join('')}</div></div>`;
     }).join('');
     const percentage=records.length?Math.round(completed/records.length*100):0;
-    return `<section class="drawer-section rw-daily-section" data-parent-task-id="${esc(parentTask.id)}"><div class="rw-daily-heading"><div><h4>Daily Tasks</h4><p>${completed} of ${records.length} completed</p></div>${canManage?`<button type="button" class="btn btn-soft" data-add-daily-task="${esc(parentTask.id)}">+ Add Daily Task</button>`:''}</div>${records.length?`<div class="rw-daily-progress" role="progressbar" aria-valuenow="${percentage}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percentage}%"></span></div>`:''}${loading?'<div class="rw-daily-empty">Loading Daily Tasks…</div>':error?`<div class="rw-daily-empty error">${esc(error)}</div>`:records.length?groupMarkup:'<div class="rw-daily-empty">No Daily Tasks yet.</div>'}</section>`;
+    const allComplete=records.length>0&&completed===records.length;
+    return `<section class="drawer-section rw-daily-section" data-parent-task-id="${esc(parentTask.id)}"><div class="rw-daily-heading"><div><span class="rw-daily-kicker">DAILY EXECUTION</span><h4>Daily Tasks</h4><p>${completed} of ${records.length} completed · ${percentage}%</p></div>${canManage?`<button type="button" class="btn btn-soft rw-daily-add" data-add-daily-task="${esc(parentTask.id)}">+ Add Daily Task</button>`:''}</div>${records.length?`<div class="rw-daily-progress" role="progressbar" aria-valuenow="${percentage}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percentage}%"></span></div>`:''}${allComplete?'<div class="rw-daily-complete-note"><span>✓</span><div><strong>All Daily Tasks Completed</strong><small>Parent task status remains separate until you update or send it for review.</small></div></div>':''}${loading?'<div class="rw-daily-empty">Loading Daily Tasks…</div>':error?`<div class="rw-daily-empty error">${esc(error)}</div>`:records.length?groupMarkup:'<div class="rw-daily-empty"><strong>No Daily Tasks yet</strong><span>Break this parent task into clear day-by-day actions.</span></div>'}</section>`;
   }
   function refreshDailyTasksSection(parentTask,options={}){
     const current=document.querySelector('.rw-daily-section');
@@ -373,6 +374,12 @@
     if(updateSection)updateSection.replaceWith(actionSection);else grid.insertAdjacentElement('afterend',actionSection);
 
     body.querySelector('.rw-daily-section')?.remove();
+    const dailyAnchor=body.querySelector('.rw-task-actions-section')||actionSection;
+    if(dailyAnchor&&dailyAnchor.isConnected){
+      dailyAnchor.insertAdjacentHTML('afterend',dailyTasksSection(parentTask,{loading:!dailyTasksByParent.has(parentTask.id)}));
+      bindDailyTaskControls(parentTask);
+      void loadDailyTasks(parentTask);
+    }
     body.querySelector('.task-approval-section')?.classList.add('rw-hidden-extra-section');
     if(commentSection){commentSection.classList.add('rw-comments-section');const heading=commentSection.querySelector('h4');if(heading)heading.textContent='Comments'}
     const commentInput=el('newComment'),commentButton=el('addComment');if(commentInput)commentInput.placeholder='Add a comment...';if(commentButton)commentButton.textContent='Add';
