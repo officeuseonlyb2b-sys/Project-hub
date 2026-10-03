@@ -30,6 +30,18 @@ const firebaseConfig = {
 const legacyWorkspacePath = 'executionHub/workspaces/default/state';
 const workspacePath = 'executionHub/workspace/employeeVisibleData/state';
 const employeeDirectoryPath = 'executionHub/workspace/employeeVisibleData/directory';
+const safeEmployeeDirectoryPath = 'executionHub/employeeDirectory/safe';
+const sharedProjectsPath = 'executionHub/shared/projects';
+const sharedTasksPath = 'executionHub/shared/tasks';
+const sharedApprovalsPath = 'executionHub/shared/approvals';
+const sharedCommentsPath = 'executionHub/shared/comments';
+const sharedActivityPath = 'executionHub/shared/activity';
+const sharedCalendarPath = 'executionHub/shared/calendar';
+const userWorkPath = 'executionHub/userWork';
+const userViewsPath = 'executionHub/userViews';
+const teamViewsPath = 'executionHub/teamViews';
+const departmentViewsPath = 'executionHub/departmentViews';
+const privatePath = 'executionHub/private';
 const adminManagementPath = 'executionHub/admin/employeeManagement';
 const employeeProfilesPath = 'executionHub/users';
 const privateDataPath = 'executionHub/admin/private';
@@ -79,6 +91,10 @@ let recoveryPending = false;
 let migrationInProgress = false;
 let appDataWritesEnabled = false;
 let deferredSaveState = null;
+let lastApplicationState = null;
+let safeEmployeeDirectoryNeedsSync = false;
+let safeEmployeeDirectoryReadable = false;
+let employeeUserWorkReadable = true;
 let lastRegularWorkSnapshot = { folders: [], categories: [], tasks: [], comments: [], approvals: [], activity: [], calendarEvents: [] };
 let stopRegularWorkWatching = null;
 let firebaseAuthState = AUTH_LOADING;
@@ -164,6 +180,30 @@ function safeDirectory(state) {
   return JSON.parse(JSON.stringify({ users, departments }));
 }
 
+function safeEmployeeDirectory(state) {
+  const users = recordsFrom(state?.users).map(account => {
+    const id = String(account.appUserId || account.id || '');
+    const designation = account.designation || account.role || 'Team Member';
+    const department = account.department || account.dept || 'Unassigned';
+    const status = account.status || (account.active === false ? 'inactive' : 'active');
+    const name = account.displayName || account.name || 'Employee';
+    return {
+      appUserId: id,
+      displayName: name,
+      designation,
+      departmentName: department,
+      departmentId: account.departmentId || '',
+      initials: account.initials || String(name).trim().split(/\s+/).slice(0, 2).map(part => part[0]?.toUpperCase() || '').join(''),
+      active: status === 'active'
+    };
+  }).filter(account => account.appUserId);
+  const departments = recordsFrom(state?.departments).map(department => ({
+    id: String(department.id || ''),
+    name: String(department.name || 'Unassigned')
+  })).filter(department => department.id);
+  return JSON.parse(JSON.stringify({ users, departments }));
+}
+
 function managementRecords(state) {
   const result = JSON.parse(JSON.stringify({ users: recordsFrom(state?.users), departments: recordsFrom(state?.departments) }));
   stripLegacyCredentials(result);
@@ -226,6 +266,12 @@ function recordIdentity(record, index) {
 
 function databaseRecordKey(id) {
   return encodeURIComponent(String(id)).replace(/\./g, '%2E');
+}
+
+function maskedDiagnosticEmail(email) {
+  const value = String(email || '');
+  const at = value.indexOf('@');
+  return at > 0 ? `${value[0]}***${value.slice(at)}` : value ? '***' : '(none)';
 }
 
 function privateCollectionsSnapshot(value) {
@@ -300,10 +346,18 @@ function stripLegacyCredentials(value) {
   Object.values(value).forEach(stripLegacyCredentials);
 }
 async function readWorkspace() {
-  const [legacySnapshot, workspaceSnapshot, directorySnapshot, managementSnapshot, privateSnapshot, profilesSnapshot, migrationSnapshot] = await Promise.all([
+  const [legacySnapshot, workspaceSnapshot, directorySnapshot, safeDirectoryResult, managementSnapshot, privateSnapshot, profilesSnapshot, migrationSnapshot] = await Promise.all([
     get(ref(database, legacyWorkspacePath)),
     get(ref(database, workspacePath)),
     get(ref(database, employeeDirectoryPath)),
+    get(ref(database, safeEmployeeDirectoryPath))
+      .then(snapshot => ({ snapshot, readable: true }))
+      .catch(error => {
+        const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
+        if (!permissionDenied) throw error;
+        console.warn('The sanitized employee directory is not readable under the currently deployed rules; Admin workspace loading will continue without syncing that optional path.');
+        return { snapshot: null, readable: false };
+      }),
     get(ref(database, adminManagementPath)),
     get(ref(database, privateDataPath)),
     get(ref(database, employeeProfilesPath)),
@@ -328,6 +382,11 @@ async function readWorkspace() {
 
   const storedDirectory = cloneWithoutCredentials(directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] });
   const directory = safeDirectory(mergeData({ users, departments }, storedDirectory));
+  const employeeDirectory = safeEmployeeDirectory(directory);
+  const safeDirectorySnapshot = safeDirectoryResult.snapshot;
+  safeEmployeeDirectoryReadable = safeDirectoryResult.readable;
+  safeEmployeeDirectoryNeedsSync = safeEmployeeDirectoryReadable
+    && JSON.stringify(employeeDirectory) !== JSON.stringify(safeDirectorySnapshot?.exists() ? safeDirectorySnapshot.val() : null);
   const operationalLegacy = cleanWorkspaceState(legacy);
   const operational = cleanWorkspaceState(mergeData(target, operationalLegacy));
 
@@ -470,19 +529,130 @@ function mergeRegularWorkIntoState(state, regularWork) {
 }
 
 async function readEmployeeWorkspace(profile) {
-  const [workspaceSnapshot, directorySnapshot] = await Promise.all([
-    get(ref(database, workspacePath)),
-    get(ref(database, employeeDirectoryPath))
+  const uid = profile?.uid;
+  if (!uid) return normalizeWorkspace(emptyState());
+
+  const [userViewSnapshot, userWorkResult, privateSnapshot, directorySnapshot] = await Promise.all([
+    get(ref(database, `${userViewsPath}/${uid}`)),
+    get(ref(database, `${userWorkPath}/${uid}`))
+      .then(snapshot => ({ snapshot, readable: true }))
+      .catch(error => {
+        const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
+        if (!permissionDenied) throw error;
+        console.warn('The employee-scoped userWork path is not readable under the currently deployed rules; continuing with independently authorized data.');
+        return { snapshot: null, readable: false };
+      }),
+    get(ref(database, `${privatePath}/${uid}`)),
+    get(ref(database, safeEmployeeDirectoryPath))
   ]);
+
+  const userView = userViewSnapshot.exists() ? userViewSnapshot.val() : {};
+  employeeUserWorkReadable = userWorkResult.readable;
+  const userWorkSnapshot = userWorkResult.snapshot;
+  const userWork = userWorkSnapshot?.exists() ? userWorkSnapshot.val() : {};
+  const privateData = privateSnapshot.exists() ? privateSnapshot.val() : {};
   const directory = directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] };
-  const state = { ...emptyState(), ...(workspaceSnapshot.exists() ? workspaceSnapshot.val() : {}), ...directory };
+
+  const projectIds = Object.keys(userView.projectAccess || {}).filter(id => userView.projectAccess[id] === true);
+  const taskIds = [...new Set([
+    ...Object.keys(userView.taskAccess || {}).filter(id => userView.taskAccess[id] === true),
+    ...Object.keys(userView.projectTaskAccess || {}).filter(id => userView.projectTaskAccess[id] === true)
+  ])];
+  const approvalIds = Object.keys(userView.approvalAccess || {}).filter(id => userView.approvalAccess[id] === true);
+  const calendarIds = Object.keys(userView.calendarAccess || {}).filter(id => userView.calendarAccess[id] === true);
+  const [projects, tasks, approvals, calendarEvents, commentsByTask, activityByTask] = await Promise.all([
+    readScopedRecords(sharedProjectsPath, projectIds),
+    readScopedRecords(sharedTasksPath, taskIds),
+    readScopedRecords(sharedApprovalsPath, approvalIds),
+    readScopedRecords(sharedCalendarPath, calendarIds),
+    readScopedGroupedRecords(sharedCommentsPath, taskIds),
+    readScopedGroupedRecords(sharedActivityPath, taskIds)
+  ]);
+  const safeUsers = recordsFrom(directory.users).map(account => ({
+    ...account,
+    id: account.appUserId,
+    name: account.displayName,
+    role: account.designation,
+    dept: account.departmentName,
+    department: account.departmentName,
+    status: account.active ? 'active' : 'inactive'
+  }));
+  const state = { ...emptyState(), ...userWork, ...directory, users: safeUsers, ...privateCollectionsSnapshot(privateData) };
+  state.projects = mergeRecordsById(userWork.projects, projects);
+  state.tasks = mergeRecordsById(userWork.tasks, tasks);
+  state.approvals = mergeRecordsById(userWork.approvals, approvals);
+  state.calendarEvents = mergeRecordsById(userWork.calendarEvents, calendarEvents);
+  state.comments = mergeRecordsById(userWork.comments, commentsByTask);
+  state.activity = mergeRecordsById(userWork.activity, activityByTask);
   state.users = recordsFrom(state.users);
   state.departments = recordsFrom(state.departments);
+
   const own = appUserFromEmployee(profile);
-  const index = state.users.findIndex(account => account.id === own.id || account.authUid === profile.uid);
+  const index = state.users.findIndex(account => account.id === own.id || account.authUid === uid);
   if (index < 0) state.users.push(own);
   else state.users[index] = { ...state.users[index], ...own };
+
   return normalizeWorkspace(state);
+}
+
+async function readScopedRecords(path, ids) {
+  const snapshots = await Promise.all(ids.map(id => get(ref(database, `${path}/${databaseRecordKey(id)}`))));
+  return snapshots.flatMap((snapshot, index) => snapshot.exists()
+    ? recordsWithKeys(snapshot.val()).map(record => ({ ...record, id: record.id || ids[index] }))
+    : []);
+}
+
+async function readScopedGroupedRecords(path, ids) {
+  const snapshots = await Promise.all(ids.map(id => get(ref(database, `${path}/${databaseRecordKey(id)}`))));
+  return snapshots.flatMap((snapshot, index) => snapshot.exists()
+    ? recordsWithKeys(snapshot.val()).map(record => ({ ...record, task: record.task || ids[index] }))
+    : []);
+}
+
+async function saveEmployeeScopedChanges(state) {
+  const previous = lastApplicationState || emptyState();
+  const saveChanged = async (path, beforeRecords, afterRecords, keyForRecord = record => record?.id, prepareRecord = record => record) => {
+    const before = new Map(recordsFrom(beforeRecords).map(record => [String(keyForRecord(record) || ''), record]));
+    for (const record of recordsFrom(afterRecords)) {
+      const id = String(keyForRecord(record) || '');
+      if (!id || JSON.stringify(before.get(id)) === JSON.stringify(record)) continue;
+      await set(ref(database, `${path}/${databaseRecordKey(id)}`), prepareRecord(record));
+    }
+  };
+  const projectTaskIds = new Set(recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work').map(task => String(task.id)));
+  await saveChanged(sharedProjectsPath, previous.projects, state.projects);
+  await saveChanged(sharedTasksPath,
+    recordsFrom(previous.tasks).filter(task => task.contextType !== 'regular_work'),
+    recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work'));
+  await saveChanged(sharedApprovalsPath,
+    recordsFrom(previous.approvals).filter(approval => !approval.contextType || approval.contextType !== 'regular_work'),
+    recordsFrom(state.approvals).filter(approval => !approval.contextType || approval.contextType !== 'regular_work'),
+    record => record?.id,
+    approval => ({ ...approval, approverIds: Object.fromEntries((approval.approvers || []).map(id => [id, true])) }));
+  const saveTaskGrouped = async (path, beforeRecords, afterRecords) => {
+    const before = new Map(recordsFrom(beforeRecords).map(record => [`${record.task || ''}/${record.id || ''}`, record]));
+    for (const record of recordsFrom(afterRecords)) {
+      const taskId = String(record.task || '');
+      const id = String(record.id || '');
+      if (!taskId || !id || !projectTaskIds.has(taskId) || JSON.stringify(before.get(`${taskId}/${id}`)) === JSON.stringify(record)) continue;
+      await set(ref(database, `${path}/${databaseRecordKey(taskId)}/${databaseRecordKey(id)}`), record);
+    }
+  };
+  await saveTaskGrouped(sharedCommentsPath,
+    recordsFrom(previous.comments).filter(record => !recordsFrom(previous.tasks).some(task => task.id === record.task && task.contextType === 'regular_work')),
+    recordsFrom(state.comments).filter(record => !recordsFrom(state.tasks).some(task => task.id === record.task && task.contextType === 'regular_work')));
+  await saveTaskGrouped(sharedActivityPath,
+    recordsFrom(previous.activity).filter(record => record.task && record.contextType !== 'regular_work'),
+    recordsFrom(state.activity).filter(record => record.task && record.contextType !== 'regular_work'));
+  await saveChanged(sharedCalendarPath,
+    recordsFrom(previous.calendarEvents).filter(event => event.contextType !== 'regular_work' && !event.regularWorkTaskId),
+    recordsFrom(state.calendarEvents).filter(event => event.contextType !== 'regular_work' && !event.regularWorkTaskId),
+    record => record?.id,
+    event => ({ ...event, participantUserIds: Object.fromEntries((event.participants || []).map(id => [id, true])) }));
+  const uid = auth.currentUser?.uid;
+  if (uid && employeeUserWorkReadable && JSON.stringify(previous.plannerRead || {}) !== JSON.stringify(state.plannerRead || {})) {
+    await set(ref(database, `${userWorkPath}/${uid}/plannerRead`), state.plannerRead || {});
+  }
 }
 
 function appUserFromEmployee(profile) {
@@ -529,6 +699,43 @@ function cloneWithoutCredentials(value) {
   const copy = value == null ? value : JSON.parse(JSON.stringify(value));
   stripLegacyCredentials(copy);
   return copy;
+}
+
+async function backupLegacyEmployeeVisibleData() {
+  if (!isSystemAdmin()) return null;
+  const backupKey = `legacy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const backupPath = `${migrationBackupsPath}/${backupKey}`;
+  const existing = await get(ref(database, backupPath));
+  if (existing.exists()) return backupPath;
+
+  const [legacySnapshot, directorySnapshot, workspaceSnapshot, managementSnapshot, privateSnapshot] = await Promise.all([
+    get(ref(database, legacyWorkspacePath)),
+    get(ref(database, employeeDirectoryPath)),
+    get(ref(database, workspacePath)),
+    get(ref(database, adminManagementPath)),
+    get(ref(database, privateDataPath))
+  ]);
+
+  const backup = {
+    migrationId,
+    createdAt: new Date().toISOString(),
+    backupPath,
+    sourcePaths: {
+      legacyWorkspacePath,
+      workspacePath,
+      employeeDirectoryPath,
+      adminManagementPath,
+      privateDataPath
+    },
+    legacyWorkspace: cloneWithoutCredentials(legacySnapshot.exists() ? legacySnapshot.val() : {}),
+    employeeVisibleState: cloneWithoutCredentials(workspaceSnapshot.exists() ? workspaceSnapshot.val() : {}),
+    directory: cloneWithoutCredentials(directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] }),
+    management: cloneWithoutCredentials(managementSnapshot.exists() ? managementSnapshot.val() : { users: [], departments: [] }),
+    privateData: cloneWithoutCredentials(privateSnapshot.exists() ? privateSnapshot.val() : {})
+  };
+
+  await set(ref(database, backupPath), backup);
+  return backupPath;
 }
 
 async function runSparkMigration() {
@@ -619,6 +826,9 @@ async function authorize(user) {
     systemAdminUid = user.uid;
   }
   const admin = isSystemAdmin(user);
+  if (admin) {
+    await backupLegacyEmployeeVisibleData();
+  }
   let profile = null;
   if (!admin) {
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${user.uid}`));
@@ -682,6 +892,7 @@ async function authorize(user) {
   window.firebaseHub.initialState = state;
   window.firebaseHub.employeeProfile = profile;
   lastStateJson = JSON.stringify(cleanWorkspaceState(state));
+  lastApplicationState = JSON.parse(JSON.stringify(state));
   return { state, admin, profile };
 }
 
@@ -760,6 +971,7 @@ async function loadClassicScript(src) {
 async function loadApplication() {
   if (appLoaded) return;
   await loadClassicScript('app.js');
+  await loadClassicScript('regular-work-comment-guard.js');
   await loadClassicScript('phase13.js');
   await loadClassicScript('phase15.js');
   await loadClassicScript('phase19.js');
@@ -846,7 +1058,15 @@ function startRealtimeSync() {
       }
       employeeProfile = profile;
       window.firebaseHub.employeeProfile = profile;
-    }, error => console.error('Could not monitor employee authorization status:', error));
+    }, error => {
+      console.error('Could not monitor employee authorization status:', error);
+      if (String(error?.code || error?.message || '').toLowerCase().includes('permission')) {
+        pendingAuthMessage = 'Your account is no longer active. Please contact the administrator.';
+        firebaseAuthState = SIGNED_OUT;
+        showLogin(pendingAuthMessage);
+        signOut(auth).catch(() => {});
+      }
+    });
     let polling = false;
     const refreshScopedState = async () => {
       if (polling || !authUser) return;
@@ -862,6 +1082,7 @@ function startRealtimeSync() {
         const json = JSON.stringify(cleanWorkspaceState(workspace));
         if (json !== lastStateJson) {
           lastStateJson = json;
+          lastApplicationState = JSON.parse(JSON.stringify(workspace));
           window.firebaseHub.initialState = workspace;
           window.applyFirebaseState(workspace);
           window.refreshFirebaseView();
@@ -878,10 +1099,14 @@ function startRealtimeSync() {
       } finally { polling = false; }
     };
     const timer = setInterval(refreshScopedState, 15000);
+    const stopUserViewWatch = onValue(ref(database, `${userViewsPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor user-scoped view updates:', error));
+    const stopUserWorkWatch = employeeUserWorkReadable
+      ? onValue(ref(database, `${userWorkPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor user-scoped work updates:', error))
+      : () => {};
     const stopTaskAccessWatch = onValue(ref(database, `${regularWorkTaskAccessPath}/${employeeProfile.appUserId}`), refreshScopedState, error => console.error('Could not monitor assigned Regular Work tasks:', error));
     const stopOwnerWorkWatch = onValue(ref(database, `${regularWorkOwnersPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor owned Regular Work structure:', error));
     if (stopRegularWorkWatching) stopRegularWorkWatching();
-    stopRegularWorkWatching = () => { stopTaskAccessWatch(); stopOwnerWorkWatch(); };
+    stopRegularWorkWatching = () => { stopUserViewWatch(); stopUserWorkWatch(); stopTaskAccessWatch(); stopOwnerWorkWatch(); };
     stopWatching = () => clearInterval(timer);
     const pending = deferredSaveState;
     deferredSaveState = null;
@@ -1024,8 +1249,15 @@ async function saveRegularWorkData(state) {
 
   for (const [taskId, accessUids] of Object.entries(next.access)) {
     const oldAccessUids=new Set(previous.access?.[taskId]||[]);
-    for(const appUserId of accessUids)if(!oldAccessUids.has(appUserId))await set(ref(database,`${regularWorkTaskAccessPath}/${appUserId}/${taskId}`),true);
     const task=next.tasks.find(record=>record.id===taskId);
+    const employeeHasDirectTaskRole = task && (
+      task.owner === employeeProfile?.appUserId
+      || task.createdByUid === actorUid
+      || task.folderOwnerUid === actorUid
+      || task.folderOwnerUserId === employeeProfile?.appUserId
+    );
+    const canGrantAssignedEmployee = task && task.owner && (task.createdByUid === actorUid || task.folderOwnerUid === actorUid);
+    for(const appUserId of accessUids)if((admin||(appUserId===employeeProfile?.appUserId&&employeeHasDirectTaskRole)||(appUserId===task?.owner&&canGrantAssignedEmployee))&&!oldAccessUids.has(appUserId))await set(ref(database,`${regularWorkTaskAccessPath}/${appUserId}/${taskId}`),true);
     if(admin||task?.createdByUid===actorUid||task?.folderOwnerUid===actorUid){
       const nextAccess=new Set(accessUids);
       for(const appUserId of oldAccessUids)if(!nextAccess.has(appUserId))await set(ref(database,`${regularWorkTaskAccessPath}/${appUserId}/${taskId}`),null);
@@ -1107,6 +1339,92 @@ window.firebaseHub = {
   async saveRegularWorkDailyTask(parentTaskId, dailyTask) {
     if (!dailyTask?.id || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId))) throw new Error('You do not have access to save a Daily Task here.');
     await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
+  },
+  async saveRegularWorkComment(comment, activity, onProgress = () => {}) {
+    const actorUid = auth.currentUser?.uid;
+    const actorEmail = auth.currentUser?.email || '';
+    const taskId = String(comment?.task || '');
+    const commentId = String(comment?.id || '');
+    const activityId = String(activity?.id || '');
+    if (!actorUid || !appDataWritesEnabled || !taskId || !commentId || !activityId || activity?.task !== taskId) {
+      throw new Error('Regular Work comment data is incomplete or the session is not ready.');
+    }
+
+    const savedComment = {
+      ...comment,
+      authorUid: comment.authorUid || actorUid,
+      actorUid: comment.actorUid || actorUid,
+      createdByUid: comment.createdByUid || actorUid
+    };
+    const savedActivity = {
+      ...activity,
+      authorUid: activity.authorUid || actorUid,
+      actorUid: activity.actorUid || actorUid,
+      createdByUid: activity.createdByUid || actorUid
+    };
+    const commentPath = `${regularWorkCommentsPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(commentId)}`;
+    const activityPath = `${regularWorkActivityPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(activityId)}`;
+    let taskAccess = isSystemAdmin() ? 'admin rule bypass (task index not required)' : 'not checked';
+    onProgress({ commentPath, activityPath, taskAccess: isSystemAdmin() ? taskAccess : 'checking', writeStarted: false, writeSuccess: false, commentReadBackExists: false, activityReadBackExists: false });
+    if (!isSystemAdmin() && employeeProfile?.appUserId) {
+      try {
+        const accessSnapshot = await get(ref(database, `${regularWorkTaskAccessPath}/${databaseRecordKey(employeeProfile.appUserId)}/${databaseRecordKey(taskId)}`));
+        taskAccess = accessSnapshot.val() === true;
+      } catch (error) {
+        console.error('[RW COMMENT] task-access diagnostic read failed', {
+          code: error?.code || '(no Firebase code)', message: error?.message || String(error || 'Unknown error'),
+          taskId, authUid: actorUid || '(none)', maskedEmail: maskedDiagnosticEmail(actorEmail), commentPath, activityPath
+        });
+        throw error;
+      }
+    }
+    onProgress({ commentPath, activityPath, taskAccess, writeStarted: false, writeSuccess: false, commentReadBackExists: false, activityReadBackExists: false });
+    const relativeUpdates = {
+      [`comments/${databaseRecordKey(taskId)}/${databaseRecordKey(commentId)}`]: savedComment,
+      [`activity/${databaseRecordKey(taskId)}/${databaseRecordKey(activityId)}`]: savedActivity
+    };
+    const matchesSavedRecord = (snapshot, expected) => {
+      const actual = snapshot.val();
+      return snapshot.exists()
+        && Object.entries(expected).every(([key, value]) => actual?.[key] === value)
+        && actual?.createdByUid === actorUid;
+    };
+    try {
+      onProgress({ writeStarted: true });
+      await update(ref(database, regularWorkPath), relativeUpdates);
+      onProgress({ writeSuccess: true });
+      const [commentSnapshot, activitySnapshot] = await Promise.all([
+        get(ref(database, commentPath)),
+        get(ref(database, activityPath))
+      ]);
+      const commentReadBackExists = matchesSavedRecord(commentSnapshot, savedComment);
+      const activityReadBackExists = matchesSavedRecord(activitySnapshot, savedActivity);
+      onProgress({ commentReadBackExists, activityReadBackExists });
+      if (!commentReadBackExists || !activityReadBackExists) throw new Error('Firebase write completed but read-back did not confirm both Regular Work comment records.');
+      const savedCommentReadBack = commentSnapshot.val();
+      const savedActivityReadBack = activitySnapshot.val();
+
+      const upsertSnapshotRecord = (records, record) => [
+        ...records.filter(item => !(item.task === record.task && item.id === record.id)),
+        record
+      ];
+      lastRegularWorkSnapshot.comments = upsertSnapshotRecord(lastRegularWorkSnapshot.comments, savedCommentReadBack);
+      lastRegularWorkSnapshot.activity = upsertSnapshotRecord(lastRegularWorkSnapshot.activity, savedActivityReadBack);
+      onProgress({ writeSuccess: true, commentReadBackExists: true, activityReadBackExists: true });
+      return { comment: savedCommentReadBack, activity: savedActivityReadBack, commentReadBackExists: true, activityReadBackExists: true };
+    } catch (error) {
+      console.error('[RW COMMENT] Firebase atomic save failed', {
+        code: error?.code || '(no Firebase code)',
+        message: error?.message || String(error || 'Unknown error'),
+        taskId,
+        authUid: actorUid || '(none)',
+        maskedEmail: maskedDiagnosticEmail(actorEmail),
+        commentPath,
+        activityPath,
+        taskAccess
+      });
+      throw error;
+    }
   },
   watchRegularWorkDailyTasks(parentTaskIds, callback) {
     if (typeof callback !== 'function') return () => {};
@@ -1203,11 +1521,11 @@ window.firebaseHub = {
     await signOut(auth);
   },
   async saveState(state) {
-    if (!auth.currentUser) return;
+    if (!auth.currentUser) return false;
     if (!appDataWritesEnabled || (isSystemAdmin() && recoveryPending)) {
       deferredSaveState = state;
       console.warn('Workspace save deferred until the legacy-data backup and recovery completes.');
-      return;
+      return false;
     }
     const cleaned = cleanWorkspaceState(state);
     const json = JSON.stringify(cleaned);
@@ -1221,18 +1539,25 @@ window.firebaseHub = {
     const regularSnapshot = regularWorkDataFromState(state, auth.currentUser.uid, admin);
     const regularJson = JSON.stringify(regularSnapshot);
     const regularChanged = regularJson !== JSON.stringify(lastRegularWorkSnapshot);
-    if (json === lastStateJson && !regularChanged && (!admin || (privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return;
+    if (json === lastStateJson && !regularChanged && (!admin || (!safeEmployeeDirectoryNeedsSync && privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return true;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       if (json !== lastStateJson) {
-        await set(ref(database, workspacePath), cleaned);
+        if (admin) await set(ref(database, workspacePath), cleaned);
+        else await saveEmployeeScopedChanges(state);
         lastStateJson = json;
       }
       if (regularChanged) await saveRegularWorkData(state);
-      if (admin && (directoryJson !== JSON.stringify(safeDirectory(adminManagement)) || managementJson !== JSON.stringify(adminManagement))) {
-        await Promise.all([
+      const directoryChanged = directoryJson !== JSON.stringify(safeDirectory(adminManagement));
+      const managementChanged = managementJson !== JSON.stringify(adminManagement);
+      const safeDirectoryChanged = safeEmployeeDirectoryReadable && (safeEmployeeDirectoryNeedsSync || directoryChanged || managementChanged);
+      if (admin && (directoryChanged || managementChanged || safeDirectoryChanged)) {
+        const adminDirectoryWrites = [
           set(ref(database, employeeDirectoryPath), directory),
           set(ref(database, adminManagementPath), management)
-        ]);
+        ];
+        if (safeDirectoryChanged) adminDirectoryWrites.push(set(ref(database, safeEmployeeDirectoryPath), safeEmployeeDirectory(state)));
+        await Promise.all(adminDirectoryWrites);
+        if (safeDirectoryChanged) safeEmployeeDirectoryNeedsSync = false;
         adminManagement = management;
       }
       if (admin && privateDataAvailable && privateJson !== lastPrivateJson) {
@@ -1264,12 +1589,15 @@ window.firebaseHub = {
           privateRecordKeys[collection] = nextKeys;
         });
       }
+      lastApplicationState = JSON.parse(JSON.stringify(state));
     });
     try {
       await saveQueue;
+      return true;
     } catch (error) {
       console.error('Could not save Firebase workspace data:', error);
       window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
+      return false;
     }
   },
   startRealtimeSync,
