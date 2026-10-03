@@ -94,7 +94,9 @@ let deferredSaveState = null;
 let lastApplicationState = null;
 let safeEmployeeDirectoryNeedsSync = false;
 let safeEmployeeDirectoryReadable = false;
+let employeeUserViewsReadable = true;
 let employeeUserWorkReadable = true;
+const employeeOptionalReadWarnings = new Set();
 let lastRegularWorkSnapshot = { folders: [], categories: [], tasks: [], comments: [], approvals: [], activity: [], calendarEvents: [] };
 let stopRegularWorkWatching = null;
 let firebaseAuthState = AUTH_LOADING;
@@ -266,12 +268,6 @@ function recordIdentity(record, index) {
 
 function databaseRecordKey(id) {
   return encodeURIComponent(String(id)).replace(/\./g, '%2E');
-}
-
-function maskedDiagnosticEmail(email) {
-  const value = String(email || '');
-  const at = value.indexOf('@');
-  return at > 0 ? `${value[0]}***${value.slice(at)}` : value ? '***' : '(none)';
 }
 
 function privateCollectionsSnapshot(value) {
@@ -528,30 +524,41 @@ function mergeRegularWorkIntoState(state, regularWork) {
   return state;
 }
 
+async function readEmployeeOptionalPath(path, label) {
+  try {
+    return { snapshot: await get(ref(database, path)), readable: true };
+  } catch (error) {
+    const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
+    if (!permissionDenied) throw error;
+    if (!employeeOptionalReadWarnings.has(path)) {
+      employeeOptionalReadWarnings.add(path);
+      console.warn(`The employee-scoped ${label} path is not readable under the currently deployed rules; continuing with independently authorized data.`);
+    }
+    return { snapshot: null, readable: false };
+  }
+}
+
 async function readEmployeeWorkspace(profile) {
   const uid = profile?.uid;
   if (!uid) return normalizeWorkspace(emptyState());
 
-  const [userViewSnapshot, userWorkResult, privateSnapshot, directorySnapshot] = await Promise.all([
-    get(ref(database, `${userViewsPath}/${uid}`)),
-    get(ref(database, `${userWorkPath}/${uid}`))
-      .then(snapshot => ({ snapshot, readable: true }))
-      .catch(error => {
-        const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
-        if (!permissionDenied) throw error;
-        console.warn('The employee-scoped userWork path is not readable under the currently deployed rules; continuing with independently authorized data.');
-        return { snapshot: null, readable: false };
-      }),
-    get(ref(database, `${privatePath}/${uid}`)),
-    get(ref(database, safeEmployeeDirectoryPath))
+  const [userViewResult, userWorkResult, privateResult, directoryResult] = await Promise.all([
+    readEmployeeOptionalPath(`${userViewsPath}/${uid}`, 'userViews'),
+    readEmployeeOptionalPath(`${userWorkPath}/${uid}`, 'userWork'),
+    readEmployeeOptionalPath(`${privatePath}/${uid}`, 'private'),
+    readEmployeeOptionalPath(safeEmployeeDirectoryPath, 'sanitized employee directory')
   ]);
 
-  const userView = userViewSnapshot.exists() ? userViewSnapshot.val() : {};
+  employeeUserViewsReadable = userViewResult.readable;
   employeeUserWorkReadable = userWorkResult.readable;
+  const userViewSnapshot = userViewResult.snapshot;
+  const privateSnapshot = privateResult.snapshot;
+  const directorySnapshot = directoryResult.snapshot;
+  const userView = userViewSnapshot?.exists() ? userViewSnapshot.val() : {};
   const userWorkSnapshot = userWorkResult.snapshot;
   const userWork = userWorkSnapshot?.exists() ? userWorkSnapshot.val() : {};
-  const privateData = privateSnapshot.exists() ? privateSnapshot.val() : {};
-  const directory = directorySnapshot.exists() ? directorySnapshot.val() : { users: [], departments: [] };
+  const privateData = privateSnapshot?.exists() ? privateSnapshot.val() : {};
+  const directory = directorySnapshot?.exists() ? directorySnapshot.val() : { users: [], departments: [] };
 
   const projectIds = Object.keys(userView.projectAccess || {}).filter(id => userView.projectAccess[id] === true);
   const taskIds = [...new Set([
@@ -970,6 +977,7 @@ async function loadClassicScript(src) {
 
 async function loadApplication() {
   if (appLoaded) return;
+  await loadClassicScript('view-routing.js');
   await loadClassicScript('app.js');
   await loadClassicScript('regular-work-comment-guard.js');
   await loadClassicScript('phase13.js');
@@ -979,6 +987,7 @@ async function loadApplication() {
   await loadClassicScript('phase18.js');
   await loadClassicScript('phase20.js');
   appLoaded = true;
+  window.executionHubModulesReady = true;
 }
 
 async function handleAuthState(user) {
@@ -1099,7 +1108,9 @@ function startRealtimeSync() {
       } finally { polling = false; }
     };
     const timer = setInterval(refreshScopedState, 15000);
-    const stopUserViewWatch = onValue(ref(database, `${userViewsPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor user-scoped view updates:', error));
+    const stopUserViewWatch = employeeUserViewsReadable
+      ? onValue(ref(database, `${userViewsPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor user-scoped view updates:', error))
+      : () => {};
     const stopUserWorkWatch = employeeUserWorkReadable
       ? onValue(ref(database, `${userWorkPath}/${authUser.uid}`), refreshScopedState, error => console.error('Could not monitor user-scoped work updates:', error))
       : () => {};
@@ -1340,9 +1351,8 @@ window.firebaseHub = {
     if (!dailyTask?.id || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId))) throw new Error('You do not have access to save a Daily Task here.');
     await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
   },
-  async saveRegularWorkComment(comment, activity, onProgress = () => {}) {
+  async saveRegularWorkComment(comment, activity) {
     const actorUid = auth.currentUser?.uid;
-    const actorEmail = auth.currentUser?.email || '';
     const taskId = String(comment?.task || '');
     const commentId = String(comment?.id || '');
     const activityId = String(activity?.id || '');
@@ -1364,21 +1374,6 @@ window.firebaseHub = {
     };
     const commentPath = `${regularWorkCommentsPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(commentId)}`;
     const activityPath = `${regularWorkActivityPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(activityId)}`;
-    let taskAccess = isSystemAdmin() ? 'admin rule bypass (task index not required)' : 'not checked';
-    onProgress({ commentPath, activityPath, taskAccess: isSystemAdmin() ? taskAccess : 'checking', writeStarted: false, writeSuccess: false, commentReadBackExists: false, activityReadBackExists: false });
-    if (!isSystemAdmin() && employeeProfile?.appUserId) {
-      try {
-        const accessSnapshot = await get(ref(database, `${regularWorkTaskAccessPath}/${databaseRecordKey(employeeProfile.appUserId)}/${databaseRecordKey(taskId)}`));
-        taskAccess = accessSnapshot.val() === true;
-      } catch (error) {
-        console.error('[RW COMMENT] task-access diagnostic read failed', {
-          code: error?.code || '(no Firebase code)', message: error?.message || String(error || 'Unknown error'),
-          taskId, authUid: actorUid || '(none)', maskedEmail: maskedDiagnosticEmail(actorEmail), commentPath, activityPath
-        });
-        throw error;
-      }
-    }
-    onProgress({ commentPath, activityPath, taskAccess, writeStarted: false, writeSuccess: false, commentReadBackExists: false, activityReadBackExists: false });
     const relativeUpdates = {
       [`comments/${databaseRecordKey(taskId)}/${databaseRecordKey(commentId)}`]: savedComment,
       [`activity/${databaseRecordKey(taskId)}/${databaseRecordKey(activityId)}`]: savedActivity
@@ -1390,16 +1385,13 @@ window.firebaseHub = {
         && actual?.createdByUid === actorUid;
     };
     try {
-      onProgress({ writeStarted: true });
       await update(ref(database, regularWorkPath), relativeUpdates);
-      onProgress({ writeSuccess: true });
       const [commentSnapshot, activitySnapshot] = await Promise.all([
         get(ref(database, commentPath)),
         get(ref(database, activityPath))
       ]);
       const commentReadBackExists = matchesSavedRecord(commentSnapshot, savedComment);
       const activityReadBackExists = matchesSavedRecord(activitySnapshot, savedActivity);
-      onProgress({ commentReadBackExists, activityReadBackExists });
       if (!commentReadBackExists || !activityReadBackExists) throw new Error('Firebase write completed but read-back did not confirm both Regular Work comment records.');
       const savedCommentReadBack = commentSnapshot.val();
       const savedActivityReadBack = activitySnapshot.val();
@@ -1410,19 +1402,8 @@ window.firebaseHub = {
       ];
       lastRegularWorkSnapshot.comments = upsertSnapshotRecord(lastRegularWorkSnapshot.comments, savedCommentReadBack);
       lastRegularWorkSnapshot.activity = upsertSnapshotRecord(lastRegularWorkSnapshot.activity, savedActivityReadBack);
-      onProgress({ writeSuccess: true, commentReadBackExists: true, activityReadBackExists: true });
       return { comment: savedCommentReadBack, activity: savedActivityReadBack, commentReadBackExists: true, activityReadBackExists: true };
     } catch (error) {
-      console.error('[RW COMMENT] Firebase atomic save failed', {
-        code: error?.code || '(no Firebase code)',
-        message: error?.message || String(error || 'Unknown error'),
-        taskId,
-        authUid: actorUid || '(none)',
-        maskedEmail: maskedDiagnosticEmail(actorEmail),
-        commentPath,
-        activityPath,
-        taskAccess
-      });
       throw error;
     }
   },

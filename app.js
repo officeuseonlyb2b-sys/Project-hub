@@ -38,7 +38,12 @@ function normalizeState(data){
 }
 let state = normalizeState(window.firebaseHub?.initialState);
 window.getFirebaseApplicationState = () => state;
-let activeView = 'dashboard';
+const viewRouter = window.executionHubViewRouting?.createViewRouter({
+  location: window.location,
+  history: window.history,
+  isSystemAdmin: () => !!window.firebaseHub?.isSystemAdmin?.()
+});
+let activeView = viewRouter?.current || 'dashboard';
 let activeProject = null;
 let activeProjectTab = 'overview';
 const today = new Date();
@@ -110,8 +115,22 @@ function bindShell(){
   el('globalSearch').addEventListener('input',e=>{ if(e.target.value.trim().length>1){activeView='projects';activeProject=null;render(e.target.value.trim().toLowerCase());}});
 }
 
-function setTitle(title,eyebrow='MANAGEMENT'){el('pageTitle').textContent=title;el('pageEyebrow').textContent=eyebrow}
+function setTitle(title,eyebrow='MANAGEMENT'){el('pageTitle').textContent=title;el('pageEyebrow').textContent=eyebrow;syncViewRoute()}
+function syncViewRoute(){
+  if(viewRouter)activeView=viewRouter.sync(activeView);
+  document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
+}
+function restoreViewRoute(){
+  if(!viewRouter)return;
+  const restored=viewRouter.restore();if(!restored)return;
+  activeView=restored;activeProject=null;activeProjectTab='overview';
+  document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
+  render();
+}
+window.addEventListener('popstate',restoreViewRoute);
+window.addEventListener('hashchange',restoreViewRoute);
 function render(search=''){
+  if(!window.executionHubModulesReady)return;
   if(activeProject){renderProject(activeProject);wireDynamic();return;}
   ({dashboard:renderDashboard,projects:()=>renderProjects(search),mywork:renderMyWork,approvals:renderApprovals,team:renderTeam,activity:renderActivity}[activeView]||renderDashboard)();
   wireDynamic();
@@ -172,8 +191,8 @@ function projectRow(p){
 }
 function attentionItems(){
   const items=[];
-  state.approvals.slice(0,2).forEach(a=>{const t=task(a.task);items.push(`<div class="attention-item"><strong>${a.type}: ${t.title}</strong><span>${user(a.requestedBy).name} • ${project(t.project).name}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Review →</button></div></div>`)});
-  state.tasks.filter(isOverdue).slice(0,2).forEach(t=>items.push(`<div class="attention-item"><strong>${t.title}</strong><span>Overdue • ${user(t.owner).name} • ${project(t.project).name}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Open →</button></div></div>`));
+  state.approvals.slice(0,2).forEach(a=>{const t=task(a.task);if(!t)return;const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${a.type}: ${t.title}</strong><span>${user(a.requestedBy).name} • ${context}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Review →</button></div></div>`)});
+  state.tasks.filter(isOverdue).slice(0,2).forEach(t=>{const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${t.title}</strong><span>Overdue • ${user(t.owner).name} • ${context}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Open →</button></div></div>`)});
   return items.join('')||`<div class="empty"><strong>Nothing urgent</strong>Your desk is clear.</div>`;
 }
 
@@ -332,7 +351,7 @@ function wireDynamic(){
   document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{activeView=b.dataset.nav;activeProject=null;activeProjectTab='overview';document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===activeView));render()});
   document.querySelectorAll('[data-project]').forEach(b=>b.onclick=()=>{activeProject=b.dataset.project;activeProjectTab='overview';render()});
   document.querySelectorAll('[data-project-tab]').forEach(b=>b.onclick=e=>{e.stopPropagation();activeProjectTab=b.dataset.projectTab;render()});
-  document.querySelectorAll('[data-task]').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
+  document.querySelectorAll('[data-task]:not(#addComment)').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
   document.querySelectorAll('.approve-btn').forEach(b=>b.onclick=()=>approve(b.dataset.approval,true));
   document.querySelectorAll('.reject-btn').forEach(b=>b.onclick=()=>approve(b.dataset.approval,false));
   const back=el('backProjects'); if(back)back.onclick=()=>{activeProject=null;activeProjectTab='overview';activeView='projects';render()};
@@ -347,7 +366,7 @@ function wireDrawer(id){
   document.querySelectorAll('.status-update').forEach(b=>b.onclick=()=>updateStatus(id,b.dataset.status));
   el('addComment').onclick=()=>addComment(id);
   document.querySelectorAll('.deadline-request').forEach(b=>b.onclick=()=>requestDeadline(id));
-  document.querySelectorAll('#drawerBody [data-task]').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
+  document.querySelectorAll('#drawerBody [data-task]:not(#addComment)').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
 }
 
 function updateStatus(id,newStatus){

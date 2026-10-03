@@ -32,5 +32,25 @@
     };
   }
 
-  return { createTaskScopedSubmitGuard, normalizeCommentText, validateRegularWorkComment };
+  const delegatedRoots = new WeakSet();
+
+  function installRegularWorkCommentClickDelegation(root, onAdd) {
+    if (!root || typeof root.addEventListener !== 'function' || typeof onAdd !== 'function') {
+      throw new TypeError('A click-event root and Add handler are required.');
+    }
+    if (delegatedRoots.has(root)) return false;
+    delegatedRoots.add(root);
+    root.addEventListener('click', event => {
+      const button = event.target?.closest?.('#addComment');
+      if (!button || button.disabled || (typeof root.contains === 'function' && !root.contains(button))) return;
+      const taskId = String(button.dataset?.task || '');
+      if (!taskId) return;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      onAdd(taskId, event, button);
+    }, true);
+    return true;
+  }
+
+  return { createTaskScopedSubmitGuard, installRegularWorkCommentClickDelegation, normalizeCommentText, validateRegularWorkComment };
 });

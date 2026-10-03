@@ -2,7 +2,8 @@
 (function(){
   const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const isAdmin=()=>!!window.firebaseHub?.isSystemAdmin();
-  const uid=()=>state.currentUser;
+  let snapshotEmployeeId='';
+  const uid=()=>isAdmin()&&state.users.some(person=>person.id===snapshotEmployeeId)?snapshotEmployeeId:state.currentUser;
   const userById=id=>state.users.find(person=>person.id===id)||{id,name:'Unassigned',initials:'?',active:false};
   const projectById=id=>state.projects.find(item=>item.id===id)||null;
   const isoDate=date=>`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
@@ -23,11 +24,17 @@
   const dailyCacheTouched=new Map();
   const title='My Work Snapshot';
 
+  function isAdminReviewingEmployee(){return isAdmin()&&uid()!==state.currentUser}
   function accessibleTask(task){
     if(!task)return false;
-    if(task.contextType==='regular_work')return !!window.firebaseHub?.canAccessRegularWorkTask(task.id);
+    if(task.contextType==='regular_work'){
+      if(!isAdminReviewingEmployee())return !!window.firebaseHub?.canAccessRegularWorkTask(task.id);
+      return task.owner===uid()||task.createdBy===uid()||task.folderOwnerUserId===uid()||(task.accessUserIds||[]).includes(uid());
+    }
     const project=projectById(task.project);
-    return !!project&&(isAdmin()||project.projectLead===uid()||(project.team||[]).includes(uid()));
+    if(!project)return false;
+    if(isAdmin()&&!isAdminReviewingEmployee())return true;
+    return project.projectLead===uid()||(project.team||[]).includes(uid());
   }
   function canTeamScope(){return isAdmin()||state.projects.some(project=>project.projectLead===uid()||(project.team||[]).includes(uid()))}
   function scopeAllowed(scope){return scope==='my'||(scope==='team'&&canTeamScope())||(scope==='department'&&isAdmin())}
@@ -71,7 +78,7 @@
   function projectScopeAllows(task,scope){
     const project=projectById(task.project);
     if(!project)return false;
-    if(isAdmin())return true;
+    if(isAdmin()&&!isAdminReviewingEmployee())return true;
     if(!accessibleTask(task))return false;
     return scope==='team'||scope==='department'||task.owner===uid();
   }
@@ -148,8 +155,8 @@
     return reviewTasks;
   }
   function authorizedApprovals(scope=scopeFilter,parents=parentTasksForScope(scope,workFilter)){
-    const ids=new Set(parents.map(task=>task.id)),projects=new Set(parents.map(task=>task.project).filter(Boolean));
-    let records=(state.approvals||[]).filter(approval=>isAdmin()||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task))||(approval.project&&projects.has(approval.project))).filter(approval=>scope!=='my'||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task)));
+    const ids=new Set(parents.map(task=>task.id)),projects=new Set(parents.map(task=>task.project).filter(Boolean)),adminWide=isAdmin()&&!isAdminReviewingEmployee();
+    let records=(state.approvals||[]).filter(approval=>adminWide||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task))||(approval.project&&projects.has(approval.project))).filter(approval=>scope!=='my'||adminWide||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task)));
     if(scope==='department'&&isAdmin()){
       const members=departmentPeople();
       records=records.filter(approval=>{
@@ -163,7 +170,7 @@
     return Object.values(approval.decisions||{}).findLast?.(decision=>decision.status==='Changes Requested')?.at||approval.requestedAt||'';
   }
   function accessibleCalendarEvent(event){
-    if(isAdmin())return true;
+    if(isAdmin()&&!isAdminReviewingEmployee())return true;
     if(event.project){const project=projectById(event.project);return !!project&&accessibleTask({project:project.id,contextType:'project'})}
     const related=event.regularWorkTaskId||event.task;
     if(related){const parent=(state.tasks||[]).find(task=>task.id===related);if(parent)return accessibleTask(parent)}
@@ -227,6 +234,11 @@
     return [['yesterday','Yesterday'],['today','Today'],['tomorrow','Tomorrow'],['week','This Week'],['month','This Month']].map(([value,label])=>`<button type="button" class="dwp-date-option ${dateFilter===value?'active':''}" data-dwp-date="${value}">${label}</button>`).join('');
   }
   function optionsMarkup(options,selected){return options.map(([value,label,disabled])=>`<option value="${value}" ${selected===value?'selected':''} ${disabled?'disabled':''}>${label}${disabled?' · Unavailable':''}</option>`).join('')}
+  function employeeSnapshotMarkup(){
+    if(!isAdmin())return '';
+    const employees=(state.users||[]).filter(person=>person.id!==state.currentUser).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+    return `<select class="dwp-select" id="dwpEmployeeSnapshot" aria-label="Employee snapshot"><option value="" ${snapshotEmployeeId?'':'selected'}>Admin View</option>${employees.map(person=>`<option value="${esc(person.id)}" ${snapshotEmployeeId===person.id?'selected':''}>${esc(person.name||person.email||person.id)}${person.active===false?' · Inactive':''}</option>`).join('')}</select>`;
+  }
   function taskSource(item){return item.sourceDetail?`${item.source} · ${item.sourceDetail}`:item.source}
   function statusClass(status){if(status==='Completed')return 'completed';if(['Waiting','Blocked'].includes(status))return 'waiting';if(['Ready for Review','Changes Required'].includes(status))return 'review';if(['Cancelled','Canceled'].includes(status))return 'cancelled';return 'progress'}
   function priorityClass(priority){return String(priority||'').toLowerCase()}
@@ -310,7 +322,7 @@
     const nextMeetingItem=nextMeeting(events),controlText=metrics.control==null?'—':`${metrics.control}%`;
     setTitle(title,'DAILY WORK PERFORMANCE');document.body.classList.add('dwp-page-active');
     const content=el('content');content.innerHTML=`<main class="dwp-page">
-      <section class="dwp-toolbar"><div class="dwp-date-switch" role="tablist" aria-label="Snapshot date">${dateButtonMarkup()}</div><div class="dwp-toolbar-right"><select class="dwp-select" id="dwpWorkType" aria-label="Work type">${optionsMarkup([['all','All Work'],['project','Project Work'],['regular','Regular Work']],workFilter)}</select><select class="dwp-select" id="dwpScope" aria-label="Scope"><option value="my" ${scopeFilter==='my'?'selected':''}>My View</option><option value="team" ${scopeFilter==='team'?'selected':''} ${canTeamScope()?'':'disabled'}>Team View${canTeamScope()?'':' · Unavailable'}</option><option value="department" ${scopeFilter==='department'?'selected':''} ${isAdmin()?'':'disabled'}>Department View${isAdmin()?'':' · Unavailable'}</option></select><button type="button" class="dwp-primary" id="dwpShareButton">▣ Share Snapshot</button></div></section>
+      <section class="dwp-toolbar"><div class="dwp-date-switch" role="tablist" aria-label="Snapshot date">${dateButtonMarkup()}</div><div class="dwp-toolbar-right">${employeeSnapshotMarkup()}<select class="dwp-select" id="dwpWorkType" aria-label="Work type">${optionsMarkup([['all','All Work'],['project','Project Work'],['regular','Regular Work']],workFilter)}</select><select class="dwp-select" id="dwpScope" aria-label="Scope"><option value="my" ${scopeFilter==='my'?'selected':''}>My View</option><option value="team" ${scopeFilter==='team'?'selected':''} ${canTeamScope()?'':'disabled'}>Team View${canTeamScope()?'':' · Unavailable'}</option><option value="department" ${scopeFilter==='department'?'selected':''} ${isAdmin()?'':'disabled'}>Department View${isAdmin()?'':' · Unavailable'}</option></select><button type="button" class="dwp-primary" id="dwpShareButton">▣ Share Snapshot</button></div></section>
       <section class="dwp-hero"><div><span class="dwp-eyebrow">TODAY</span><h2>${esc(todayLabel)}</h2><p>Your operational view across projects, regular work, approvals and planner.</p></div><div class="dwp-control-score"><strong>${controlText}</strong><span>Work under control</span>${metrics.control==null?'<small>Not enough due-work data</small>':'<small>Based on on-time due items in this date range</small>'}</div></section>
       ${renderKpiGrid(metrics)}
       <section class="dwp-two-col"><article class="dwp-card"><div class="dwp-section-head"><div><h3>Day-by-day comparison</h3><p>Yesterday, today and tomorrow at a glance.</p></div></div>${renderComparison(items,events)}</article><article class="dwp-card"><div class="dwp-section-head"><div><h3>Approvals &amp; reviews</h3><p>What needs a decision in this date range.</p></div><button type="button" class="dwp-text-button" data-dwp-open-view="approvals">View approvals →</button></div>${renderApprovalCard(approvalsGroups)}</article></section>
@@ -339,10 +351,12 @@
     requestAnimationFrame(()=>backdrop.classList.add('open'));
   }
   function closeDrill(){document.getElementById('dwpDrillBackdrop')?.classList.remove('open')}
-  function goToView(view){activeProject=null;activeView=view;sessionStorage.setItem('executionHub.activeView',view);document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===view));render()}
+  function goToView(view){activeProject=null;activeView=view;document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===view));render()}
   function rangeItemsForDay(items,date){return items.filter(item=>itemDate(item)===date&&!isTerminal(item))}
   function bindMainPage(items,approvals,events,metrics,windowRange,approvalGroups){
     document.querySelectorAll('[data-dwp-date]').forEach(button=>button.onclick=()=>{dateFilter=button.dataset.dwpDate;renderDailyWork()});
+    const employeeSelect=document.getElementById('dwpEmployeeSnapshot');
+    if(employeeSelect)employeeSelect.onchange=event=>{snapshotEmployeeId=event.target.value;renderDailyWork()};
     document.getElementById('dwpWorkType').onchange=event=>{workFilter=event.target.value;renderDailyWork()};
     document.getElementById('dwpScope').onchange=event=>{scopeFilter=event.target.value;if(!scopeAllowed(scopeFilter))scopeFilter='my';renderDailyWork()};
     document.querySelectorAll('[data-dwp-range]').forEach(button=>button.onclick=()=>{chartDays=Number(button.dataset.dwpRange);renderDailyWork()});
@@ -408,10 +422,8 @@
   });
   const originalRefresh=window.refreshFirebaseView;
   window.refreshFirebaseView=function(...args){const result=originalRefresh?.apply(this,args);if(activeView==='dailywork'&&!shareMode)renderDailyWork();else if(shareMode)renderShareSnapshot();return result};
-  const savedView=sessionStorage.getItem('executionHub.activeView');if(savedView==='dailywork')activeView='dailywork';
   const baseRender=render;
   render=function(search=''){
-    sessionStorage.setItem('executionHub.activeView',activeView);
     if(activeProject){document.body.classList.remove('dwp-page-active');stopDailyWatchers();return baseRender(search)}
     if(activeView==='dailywork'){renderDailyWork();wireDynamic();return}
     document.body.classList.remove('dwp-page-active');stopDailyWatchers();return baseRender(search);

@@ -5,24 +5,7 @@
   const directorId='u1';
   const commentHelpers=window.regularWorkCommentHelpers;
   const regularWorkCommentSaving=commentHelpers?.createTaskScopedSubmitGuard();
-  const regularWorkCommentDiagnostics=new Map();
-
-  function updateRegularWorkCommentDiagnostics(taskId,updates={}){
-    const key=String(taskId),previous=regularWorkCommentDiagnostics.get(key)||{};
-    const info={...previous,...updates,taskId:key};regularWorkCommentDiagnostics.set(key,info);
-    const panel=el('regularWorkCommentDebug');if(!panel||panel.dataset.taskId!==key)return;
-    const values=[['Task ID',info.taskId],['Firebase Auth UID',info.authUid],['Email',info.maskedEmail],['System Admin',info.isSystemAdmin],['Comment path',info.commentPath],['Activity path',info.activityPath],['Task access index',info.taskAccess],['Handler called',info.handlerCalled],['Write started',info.writeStarted],['Write success',info.writeSuccess],['Comment read-back exists',info.commentReadBackExists],['Activity read-back exists',info.activityReadBackExists],['State merge complete',info.stateMergeComplete],['Drawer rerender complete',info.drawerRerenderComplete]];
-    panel.innerHTML=`<strong>Temporary comment diagnostics</strong><div class="rw-comment-debug-grid">${values.map(([label,value])=>`<div><span>${escapeHtml(label)}</span><b>${escapeHtml(value===undefined?'pending':value===null?'unavailable':String(value))}</b></div>`).join('')}</div>${info.errorCode||info.errorMessage?`<div class="rw-comment-debug-error"><b>${escapeHtml(info.errorCode||'Firebase error')}</b><span>${escapeHtml(info.errorMessage||'')}</span></div>`:''}`;
-  }
-
-  function regularWorkCommentDebugMarkup(taskId){
-    return `<div id="regularWorkCommentDebug" class="rw-comment-debug" data-task-id="${escapeHtml(taskId)}" role="status" aria-live="polite"><strong>Temporary comment diagnostics</strong><span>Waiting for Add click…</span></div>`;
-  }
-
-  function maskDiagnosticEmail(email){
-    const value=String(email||'');const at=value.indexOf('@');
-    return at>0?`${value[0]}***${value.slice(at)}`:value?'***':'(none)';
-  }
+  commentHelpers?.installRegularWorkCommentClickDelegation(document,taskId=>addComment(taskId));
 
   function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
   function normalizeEmail(v){return String(v||'').trim().toLowerCase()}
@@ -269,9 +252,6 @@
     el('drawerEyebrow').textContent=`REGULAR WORK • ${String(t.regularFolderName||'Folder').toUpperCase()} • ${String(t.regularCategoryName||t.workstream||'CATEGORY').toUpperCase()}`;
     el('drawerTitle').textContent=t.title;
     el('drawerBody').innerHTML=`<div class="drawer-section"><div class="drawer-actions">${priorityPill(t.priority)}${statusPill(isOverdue(t)?'Overdue':t.status)}<span class="project-role-badge">Your authority: ${authority}</span>${t.waitingOn?`<span class="status-pill waiting">Waiting on ${t.waitingOn.startsWith?.('u')?user(t.waitingOn).name:t.waitingOn}</span>`:''}</div></div><div class="drawer-section"><h4>Task details</h4><div class="detail-grid"><div class="detail-box"><span>Folder / Topic</span><strong>${escapeHtml(t.regularFolderName||'Regular Work')}</strong></div><div class="detail-box"><span>Category</span><strong>${escapeHtml(t.regularCategoryName||t.workstream||'—')}</strong></div><div class="detail-box"><span>Created by</span><strong>${user(t.createdBy).name}</strong></div><div class="detail-box"><span>Assigned to</span><strong>${user(t.owner).name}</strong></div>${t.description?`<div class="detail-box wide"><span>Description</span><strong>${escapeHtml(t.description)}</strong></div>`:''}${t.startDate?`<div class="detail-box"><span>Start date</span><strong>${fmtDateFull(t.startDate)}</strong></div>`:''}<div class="detail-box"><span>Original Due</span><strong>${fmtDateFull(t.originalDue)}</strong></div><div class="detail-box"><span>Current Due</span><strong>${fmtDateFull(t.currentDue)}</strong></div><div class="detail-box"><span>Progress</span><strong>${t.progress}%</strong></div><div class="detail-box"><span>Next Action</span><strong>${escapeHtml(t.next||'—')}</strong></div></div></div>${editable?`<div class="drawer-section"><h4>Update work</h4><div class="drawer-actions"><button class="btn btn-soft status-update" data-task="${id}" data-status="In Progress">Start / Resume</button><button class="btn btn-soft status-update" data-task="${id}" data-status="Ready for Review">Ready for Review</button><button class="btn btn-ghost deadline-request" data-task="${id}">Request Deadline Change</button></div></div>`:''}<div class="drawer-section"><h4>Comments</h4>${commentable?`<div class="comment-box"><textarea id="newComment" placeholder="Add an update, blocker, decision or @mention…"></textarea><button class="btn btn-soft" id="addComment" data-task="${id}">Post</button></div>`:''}${comments.map(comment=>`<div class="comment">${avatar(comment.user)}<div><strong>${user(comment.user).name}</strong> <span>• ${fmtTime(comment.time)}</span><p>${escapeHtml(comment.text)}</p></div></div>`).join('')||'<div class="subtle" style="margin-top:12px">No comments yet.</div>'}</div><div class="drawer-section"><h4>Activity history</h4><div class="activity">${history.map(activityItem).join('')||'<div class="subtle">No recorded activity yet.</div>'}</div></div>`;
-    const commentsSection=[...el('drawerBody').querySelectorAll('.drawer-section')].find(section=>section.querySelector('h4')?.textContent==='Comments');
-    if(commentsSection&&!commentsSection.querySelector('#regularWorkCommentDebug'))commentsSection.insertAdjacentHTML('beforeend',regularWorkCommentDebugMarkup(id));
-    updateRegularWorkCommentDiagnostics(id);
     const canReassign=!!window.firebaseHub?.isSystemAdmin?.()||t.createdBy===state.currentUser||t.folderOwnerUserId===window.firebaseHub?.firebaseUid;
     if(canReassign){const updateSection=[...el('drawerBody').querySelectorAll('.drawer-section')].find(section=>section.querySelector('h4')?.textContent==='Update work');if(updateSection)updateSection.insertAdjacentHTML('beforeend',`<div class="regular-reassign-row"><label class="form-field"><span>Reassign to</span><select class="select" id="regularTaskAssignee">${state.users.filter(account=>account.active!==false).map(account=>`<option value="${escapeHtml(account.id)}" ${account.id===t.owner?'selected':''}>${escapeHtml(account.name)}</option>`).join('')}</select></label><button type="button" class="btn btn-ghost" id="saveRegularTaskAssignee">Save Assignment</button></div>`)}
     el('taskDrawer').classList.add('open');el('drawerBackdrop').classList.add('open');wireDrawer(id);
@@ -280,12 +260,10 @@
 
   updateStatus=function(id,newStatus){const t=task(id);if(!t||!canEditTask(t))return toast('You do not have permission to update this task.');const old=t.status;if(old===newStatus)return toast('Task is already in that status.');t.status=newStatus;if(newStatus==='Ready for Review')t.progress=100;log(state.currentUser,t.project,t.id,'Status',`changed status from ${old} to ${newStatus}`,`${old} → ${newStatus}`);if(newStatus==='Ready for Review'&&!state.approvals.some(a=>a.task===id&&a.type==='Deliverable Review'))state.approvals.unshift({id:'a'+Date.now(),type:'Deliverable Review',task:id,requestedBy:state.currentUser,requestedAt:new Date().toISOString(),detail:'Task submitted for review.'});save();toast(`Status updated to ${newStatus}`);openTask(id);render()};
   addComment=async function(id){
-    const t=task(id);if(!t||!canCommentTask(t))return toast('You do not have access to comment here.');
+    const t=task(id);
+    if(!t||!canCommentTask(t))return toast('You do not have access to comment here.');
     const box=el('newComment'),rawText=box?.value||'';
     if(t.contextType==='regular_work'){
-      const firebaseUser=window.firebaseHub?.authUser;
-      updateRegularWorkCommentDiagnostics(id,{handlerCalled:true,taskId:t.id,authUid:firebaseUser?.uid||'(none)',maskedEmail:maskDiagnosticEmail(firebaseUser?.email),isSystemAdmin:!!window.firebaseHub?.isSystemAdmin?.(),writeStarted:false,writeSuccess:false,commentReadBackExists:false,activityReadBackExists:false,stateMergeComplete:false,drawerRerenderComplete:false,commentPath:'pending',activityPath:'pending',taskAccess:'pending',errorCode:'',errorMessage:''});
-      console.info('[RW COMMENT]',{taskId:t.id,hasAuth:!!firebaseUser,authUid:firebaseUser?.uid||'(none)',maskedEmail:maskDiagnosticEmail(firebaseUser?.email),isSystemAdmin:!!window.firebaseHub?.isSystemAdmin?.(),saveFunctionAvailable:typeof window.firebaseHub?.saveRegularWorkComment==='function'});
       const validation=commentHelpers?.validateRegularWorkComment(rawText)||{text:String(rawText).trim(),error:String(rawText).trim()?'':'Please enter a comment.'};
       if(validation.error)return toast(validation.error);
       if(regularWorkCommentSaving?.isSaving(id))return;
@@ -298,22 +276,18 @@
         const comment={id:commentId,task:id,user:state.currentUser,time:now,text:validation.text};
         const activity={id:activityId,time:now,user:state.currentUser,task:id,type:'Comment',text:'added a comment',change:'',contextType:'regular_work'};
         try{
-          const result=await window.firebaseHub.saveRegularWorkComment(comment,activity,progress=>updateRegularWorkCommentDiagnostics(id,progress));
+          const result=await window.firebaseHub.saveRegularWorkComment(comment,activity);
           if(!result?.commentReadBackExists||!result?.activityReadBackExists)throw new Error('Firebase read-back did not confirm both Regular Work comment records.');
           const savedComment=result.comment,savedActivity=result.activity;
           const commentIndex=state.comments.findIndex(record=>record.task===id&&record.id===savedComment.id);
           if(commentIndex<0)state.comments.push(savedComment);else state.comments[commentIndex]=savedComment;
           const activityIndex=state.activity.findIndex(record=>record.task===id&&record.id===savedActivity.id);
           if(activityIndex<0)state.activity.unshift(savedActivity);else state.activity[activityIndex]=savedActivity;
-          updateRegularWorkCommentDiagnostics(id,{stateMergeComplete:true});
           openTask(id);
-          updateRegularWorkCommentDiagnostics(id,{drawerRerenderComplete:true});
           if(box)box.value='';
           toast('Comment added');
         }catch(error){
-          const firebaseUser=window.firebaseHub?.authUser;
-          updateRegularWorkCommentDiagnostics(id,{errorCode:error?.code||'(no Firebase code)',errorMessage:error?.message||String(error||'Unknown error'),stateMergeComplete:false,drawerRerenderComplete:false});
-          console.error('[RW COMMENT] save failed',{code:error?.code||'(no Firebase code)',message:error?.message||String(error||'Unknown error'),taskId:t.id,authUid:firebaseUser?.uid||'(none)',maskedEmail:maskDiagnosticEmail(firebaseUser?.email),commentPath:`executionHub/regularWork/comments/${t.id}/${commentId}`,activityPath:`executionHub/regularWork/activity/${t.id}/${activityId}`});
+          console.error('Regular Work comment save failed:',error);
           toast('Comment could not be saved. Please try again.');
           openTask(id);
           const restoredBox=el('newComment');if(restoredBox)restoredBox.value=rawText;
@@ -331,13 +305,13 @@
   requestDeadline=function(id){const t=task(id);if(!t||!canEditTask(t))return toast('You do not have permission to request changes for this task.');const input=prompt(`Current due date is ${t.currentDue}. Enter requested new due date (YYYY-MM-DD):`,t.currentDue);if(!input||input===t.currentDue)return;const reason=prompt('Reason for deadline change:','');if(!reason)return;state.approvals.unshift({id:'a'+Date.now(),type:'Deadline Change',task:id,requestedBy:state.currentUser,requestedAt:new Date().toISOString(),detail:`Requested ${fmtDateFull(input)}. Reason: ${reason}`});log(state.currentUser,t.project,id,'Deadline','requested deadline revision',`Current: ${fmtDateFull(t.currentDue)} → Requested: ${fmtDateFull(input)} • Reason: ${reason}`);t.pendingDue=input;save();toast('Deadline change sent for approval.');openTask(id)};
   approve=function(aid,ok){const a=state.approvals.find(x=>x.id===aid);if(!a)return;const t=task(a.task);if(!t||!canApproveTask(t))return toast('You do not have approval authority for this task.');if(ok&&a.type==='Deadline Change'&&t.pendingDue){const old=t.currentDue;t.currentDue=t.pendingDue;delete t.pendingDue;t.reschedules=(t.reschedules||0)+1;log(state.currentUser,t.project,t.id,'Approval','approved deadline revision',`${fmtDateFull(old)} → ${fmtDateFull(t.currentDue)} • Original remains ${fmtDateFull(t.originalDue)}`)}else if(ok&&a.type==='Deliverable Review'){t.status='Completed';t.progress=100;t.completedAt=new Date().toISOString();log(state.currentUser,t.project,t.id,'Approval','approved deliverable and marked task Completed')}else log(state.currentUser,t.project,t.id,'Approval',`rejected ${a.type.toLowerCase()}`);state.approvals=state.approvals.filter(x=>x.id!==aid);save();toast(ok?'Approved and recorded.':'Rejected and recorded.');render()};
 
-  wireDrawer=function(id){document.querySelectorAll('.status-update').forEach(b=>b.onclick=()=>updateStatus(id,b.dataset.status));const add=el('addComment');if(add){add.onclick=()=>addComment(id);if(regularWorkCommentSaving?.isSaving(id)){add.disabled=true;add.setAttribute('aria-busy','true')}}document.querySelectorAll('.deadline-request').forEach(b=>b.onclick=()=>requestDeadline(id));document.querySelectorAll('#drawerBody [data-task]').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)})};
+  wireDrawer=function(id){document.querySelectorAll('.status-update').forEach(b=>b.onclick=()=>updateStatus(id,b.dataset.status));const add=el('addComment');if(add){add.disabled=regularWorkCommentSaving?.isSaving(id)||false;add.setAttribute('aria-busy',String(add.disabled))}document.querySelectorAll('.deadline-request').forEach(b=>b.onclick=()=>requestDeadline(id));document.querySelectorAll('#drawerBody [data-task]:not(#addComment)').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)})};
 
   wireDynamic=function(){
     document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{activeView=b.dataset.nav;activeProject=null;activeProjectTab='overview';document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===activeView));render()});
     document.querySelectorAll('[data-project]').forEach(b=>b.onclick=()=>{const p=project(b.dataset.project);if(!canViewProject(p))return toast('This project is private to its selected team.');activeProject=b.dataset.project;activeProjectTab='overview';render()});
     document.querySelectorAll('[data-project-tab]').forEach(b=>b.onclick=e=>{e.stopPropagation();activeProjectTab=b.dataset.projectTab;render()});
-    document.querySelectorAll('[data-task]').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
+    document.querySelectorAll('[data-task]:not(#addComment)').forEach(b=>b.onclick=e=>{e.stopPropagation();openTask(b.dataset.task)});
     document.querySelectorAll('.approve-btn').forEach(b=>b.onclick=()=>approve(b.dataset.approval,true));document.querySelectorAll('.reject-btn').forEach(b=>b.onclick=()=>approve(b.dataset.approval,false));
     const back=el('backProjects');if(back)back.onclick=()=>{activeProject=null;activeProjectTab='overview';activeView='projects';render()};
     const wf=el('projectWorkstreamFilter'),sf=el('projectStatusFilter');if(wf||sf){const apply=()=>document.querySelectorAll('[data-task-row]').forEach(row=>{const okW=!wf||!wf.value||row.dataset.workstream===wf.value,okS=!sf||!sf.value||row.dataset.status===sf.value;row.style.display=okW&&okS?'':'none'});if(wf)wf.onchange=apply;if(sf)sf.onchange=apply}
