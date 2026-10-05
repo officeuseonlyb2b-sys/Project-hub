@@ -21,7 +21,7 @@ This package is the clean functional prototype prepared for developer review bef
 
 The final review build contains no seeded employees, email addresses, passwords, projects, departments, tasks, approvals or meetings.
 
-There is no in-app registration or first-user Admin flow. The single System Admin is created manually in Firebase Authentication using `ashish@arpitatravels.com`. On first sign-in, the trusted `authorizeSystemAdmin` callable creates the UID-keyed authorization record at `executionHub/admin/authorization/{uid}` with `role: "system_admin"`; browser and database authorization then use that UID-backed profile. The Admin creates employee Auth accounts from **People & Departments**.
+There is no in-app public registration screen or first-user Admin flow. System Admin access is bound in client code and RTDB rules to the trusted Firebase Auth UID plus the verified Admin email `ashish@enchantingmp.in`. No Cloud Functions/Admin SDK source is present in this workspace.
 
 ## Firebase setup
 
@@ -30,23 +30,27 @@ The browser app is connected to the Firebase project configured in `firebase-boo
 - Firebase Authentication (Email/Password) signs in the one Admin and pre-created employee accounts.
 - Firebase Realtime Database stores workspace data at `executionHub/workspaces/default/state` and employee authorization profiles at `executionHub/users/{uid}`.
 - Passwords are managed only by Firebase Authentication. Temporary passwords exist only in the Admin's form memory during account creation; they are never added to a profile or app state.
+- The employee creation form enforces a 14-character temporary-password minimum. Configure and verify the Firebase Authentication password policy separately; the UI limit does not enforce policy on other Auth clients or password-reset flows.
 - Employee profile `role` is fixed to `employee`; employee status must be `active` at sign-in. `inactive`, `resigned`, and `suspended` accounts are signed out.
-- Employee accounts are created through a secondary Firebase Auth app to preserve the Admin's current session.
+- Employee Auth accounts are created in the browser through a secondary Firebase Auth app, then the client writes the UID-keyed employee profile. RTDB rules restrict those profile writes to the trusted Admin UID with the verified configured Admin email; this is not trusted server-side provisioning.
+- Email/Password self-sign-up is not exposed in the UI, but the enabled Firebase Email/Password provider accepts public Auth sign-up requests through the Firebase Auth API. Unrecognized accounts are denied application profile and RTDB access by the UID-backed rules; this does not prevent creation of unused Auth accounts. Prevent public Auth account creation by moving employee provisioning to a trusted Admin SDK callable before claiming self-sign-up is disabled.
+- Configure the strongest available System Admin protection in Firebase Authentication (MFA, preferably TOTP, verified recovery methods, and a unique phishing-resistant password where supported). This workspace cannot verify Firebase Console enrollment or policy state.
 - The prior browser cache is scrubbed and removed on startup. If Firebase has no workspace data, the Admin's first successful sign-in can migrate existing local project/task/business data after stripping legacy password fields.
 
 ### Firebase Console / deployment steps
 
 1. In **Authentication → Sign-in method**, enable Email/Password.
-2. Manually create the sole Admin Auth account `ashish@arpitatravels.com`; do not register it from the app.
-3. Install the Firebase CLI and run `firebase deploy --only database,functions` from this folder. The callable functions require the Blaze billing plan and deploy to `asia-southeast1`.
-4. Serve `index.html` over HTTP (Five Server is fine); ES module imports do not work from `file://`.
-5. Sign in as the Admin and create employees from People & Departments. Do not create test/production users during validation.
+2. Use the trusted Admin Auth account `ashish@enchantingmp.in`; do not register it from the app. Verify the account's email in Firebase Authentication; an unverified email cannot authorize Admin access.
+3. Confirm the configured trusted UID in Firebase Console → Authentication → Users → select the Admin account → **User UID**. The workspace binds Admin access to `lGhNVO4kclh133CqgCiyPo3V5DA3`; the Console value must match exactly.
+4. Review and deploy approved Firebase resources explicitly. The hosting headers in `firebase.json` only apply when Firebase Hosting is used and deployed; Five Server does not attach these response headers. No deploy was performed during the security hardening pass.
+5. Serve `index.html` over HTTP (Five Server is fine); ES module imports do not work from `file://`.
+6. Sign in as the Admin and create employees from People & Departments. Do not create test/production users during validation.
 
 ### Authorization boundaries
 
-`database.rules.json` denies unauthenticated access and limits direct shared-workspace access to the UID-backed System Admin profile. Employees load and save project-scoped workspace data through the callable functions, which validate profile status, project membership, ownership, and mutable fields. Employees can read only their own profile; only the System Admin can manage employee profiles or access `executionHub/admin/private`. This also prevents access to legacy private records that may still be present in the shared workspace before the Admin's first successful migration.
+`database.rules.json` denies unauthenticated and unmapped users, gives employees access only when an active UID-keyed employee profile exists, and limits each employee to scoped project/Regular Work data. Employees can read only their own employee profile; only the exact trusted Admin UID with `email_verified === true` and the matching Admin email can manage employee profiles or access Admin-scoped data. The UID must be sourced from Firebase Console → Authentication → Users → the Admin account → User UID. Firebase Console MFA enrollment and password-policy configuration cannot be verified from this workspace.
 
-This is stronger than UI-only gating, but privileged app logic still resides in Cloud Functions. Keep the Admin Auth account secured with MFA, monitor function/audit logs, and review the callable permission allowlists as workflows evolve. The callable state merge deliberately favors denying unsupported employee mutations; new workflow features must be added to the server validator, not just the browser UI. RTDB rules cannot provide strong per-record authorization for the existing shared JSON state by themselves.
+This is stronger than UI-only gating for employee data access, but employee provisioning remains client based. To prevent public Auth account creation while retaining employee provisioning, move account creation/profile writes to a trusted Admin SDK service (an existing internal backend, or a separately approved Cloud Run/Functions service); do not ship service-account credentials to the browser. No such backend source is present here. New workflow mutations must remain covered by RTDB rules and server validators if a backend is added.
 
 For a clean reset, remove the workspace records and employee profiles in Realtime Database and remove test Auth users from Firebase Authentication. Clearing browser data does not clear cloud data.
 
@@ -75,7 +79,7 @@ Recommended production pattern: private responsive web application + PostgreSQL 
 - `app.js` — core state, dashboard, projects, tasks and base interactions
 - `firebase-bootstrap.js` — Firebase initialization, authentication adapter, Realtime Database sync, and classic-script startup loader
 - `database.rules.json` — Admin-only shared-state writes and UID-scoped employee profile rules
-- `functions/index.js` — Admin-only employee profile creation plus UID/status-validated, project-scoped workspace load/save callables
+- `functions/` — no trusted provisioning/authorization source is currently present in this workspace
 - `firebase.json` / `.firebaserc` — Firebase CLI deployment configuration
 - `phase13.js` — account/project administration and access workflows
 - `phase15.js` — Planner, meetings, work blocks and reminders

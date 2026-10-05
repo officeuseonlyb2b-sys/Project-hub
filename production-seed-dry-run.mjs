@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const project = 'project-hub-emp';
-const adminEmail = 'ashish@arpitatravels.com';
+const adminEmail = 'ashish@enchantingmp.in';
 const paths = [
   'executionHub/workspace/employeeVisibleData/state',
   'executionHub/workspace/employeeVisibleData/directory',

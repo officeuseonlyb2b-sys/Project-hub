@@ -1,10 +1,13 @@
 /* Execution Hub — Daily Work Performance, derived from existing authorized live state */
 (function(){
   const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const dailyWorkModel=window.DailyWorkModel;
   const isAdmin=()=>!!window.firebaseHub?.isSystemAdmin();
   let snapshotEmployeeId='';
   const uid=()=>isAdmin()&&state.users.some(person=>person.id===snapshotEmployeeId)?snapshotEmployeeId:state.currentUser;
   const userById=id=>state.users.find(person=>person.id===id)||{id,name:'Unassigned',initials:'?',active:false};
+  const allEmployeesSelected=()=>isAdmin()&&!snapshotEmployeeId;
+  const matchesPerson=(value,personId=uid())=>dailyWorkModel.matchesEmployee(value,personId,state.users);
   const projectById=id=>state.projects.find(item=>item.id===id)||null;
   const isoDate=date=>`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
   const parseDate=value=>value?new Date(`${String(value).slice(0,10)}T00:00:00`):null;
@@ -14,14 +17,14 @@
   const timeText=value=>value?new Date(value).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'';
   const fullDate=value=>value?parseDate(value).toLocaleDateString('en-GB',{weekday:'long',day:'2-digit',month:'long',year:'numeric'}):'';
   const itemDate=item=>String(item.dueDate||'').slice(0,10);
-  const isTerminal=item=>['Completed','Cancelled','Canceled'].includes(item.status);
+  const isTerminal=item=>item.archived===true||['completed','cancelled','canceled','archived'].includes(String(item.status||'').toLowerCase());
   const overdueState=item=>!isTerminal(item)&&item.status!=='Ready for Review';
   const priorityWeight=priority=>priority==='P0'?4:priority==='P1'?3:priority==='P2'?2:1;
   const priorityLabel=priority=>({P0:'P0 · Critical',P1:'P1 · High',P2:'P2 · Medium',P3:'P3 · Low'})[priority]||priority||'—';
   let dateFilter='today',workFilter='all',scopeFilter='my',chartDays=7;
   let shareMode=false,drillCleanup=null;
   let dailyCache=new Map(),dailyListenerStop=null,dailyListenerKey='';
-  const dailyCacheTouched=new Map();
+  let dailyPendingIds=new Set(),dailyHydrationError='';
   const title='My Work Snapshot';
 
   function isAdminReviewingEmployee(){return isAdmin()&&uid()!==state.currentUser}
@@ -29,14 +32,14 @@
     if(!task)return false;
     if(task.contextType==='regular_work'){
       if(!isAdminReviewingEmployee())return !!window.firebaseHub?.canAccessRegularWorkTask(task.id);
-      return task.owner===uid()||task.createdBy===uid()||task.folderOwnerUserId===uid()||(task.accessUserIds||[]).includes(uid());
+      return matchesPerson(task.owner)||matchesPerson(task.createdBy)||matchesPerson(task.folderOwnerUserId)||(task.accessUserIds||[]).some(value=>matchesPerson(value));
     }
     const project=projectById(task.project);
     if(!project)return false;
     if(isAdmin()&&!isAdminReviewingEmployee())return true;
-    return project.projectLead===uid()||(project.team||[]).includes(uid());
+    return matchesPerson(project.projectLead)||(project.team||[]).some(value=>matchesPerson(value));
   }
-  function canTeamScope(){return isAdmin()||state.projects.some(project=>project.projectLead===uid()||(project.team||[]).includes(uid()))}
+  function canTeamScope(){return isAdmin()||state.projects.some(project=>matchesPerson(project.projectLead)||(project.team||[]).some(value=>matchesPerson(value)))}
   function scopeAllowed(scope){return scope==='my'||(scope==='team'&&canTeamScope())||(scope==='department'&&isAdmin())}
   function dateWindow(mode=dateFilter){
     const base=today();
@@ -47,7 +50,7 @@
     return {start:base,end:base};
   }
   function inWindow(value,window=dateWindow()){
-    const day=String(value||'').slice(0,10);return !!day&&day>=window.start&&day<=window.end;
+    const day=dailyWorkModel.dateOf(value);return !!day&&day>=window.start&&day<=window.end;
   }
   function activityForTask(taskId){return (state.activity||[]).filter(event=>(event.task===taskId||event.regularWorkTaskId===taskId)&&event.time).sort((a,b)=>String(a.time).localeCompare(String(b.time)))}
   function completionTime(task){
@@ -78,13 +81,13 @@
   function projectScopeAllows(task,scope){
     const project=projectById(task.project);
     if(!project)return false;
-    if(isAdmin()&&!isAdminReviewingEmployee())return true;
+    if(allEmployeesSelected())return true;
     if(!accessibleTask(task))return false;
-    return scope==='team'||scope==='department'||task.owner===uid();
+    return scope==='team'||scope==='department'||matchesPerson(task.owner);
   }
   function parentTaskScopeAllows(task,scope){
     if(!accessibleTask(task))return false;
-    if(scope==='my')return task.owner===uid()||task.createdBy===uid()||(task.accessUserIds||[]).includes(uid());
+    if(scope==='my')return allEmployeesSelected()||matchesPerson(task.owner)||matchesPerson(task.createdBy)||(task.accessUserIds||[]).some(value=>matchesPerson(value));
     return true;
   }
   function parentTasksForScope(scope=scopeFilter,type=workFilter){
@@ -96,26 +99,43 @@
       return projectScopeAllows(task,scope);
     });
   }
+  function dailyParentsForScope(scope=scopeFilter,type=workFilter){
+    if(scope!=='my')return parentTasksForScope(scope,type).filter(task=>task.contextType==='regular_work');
+    return (state.tasks||[]).filter(task=>task.contextType==='regular_work'&&type!=='project'&&accessibleTask(task));
+  }
   function departmentPeople(){
+    if(allEmployeesSelected())return new Set((state.users||[]).filter(person=>person.active!==false&&person.id!=='u1').map(person=>person.id));
     const profile=userById(uid()),departmentId=profile.departmentId;
     return new Set((state.users||[]).filter(person=>person.active!==false&&(departmentId?person.departmentId===departmentId:person.dept===profile.dept)).map(person=>person.id));
   }
   function scopeItems(scope=scopeFilter,type=workFilter){
     let parents=parentTasksForScope(scope,type);
+    let dailyParents=dailyParentsForScope(scope,type);
+    let departmentMembers=null;
     if(scope==='department'&&isAdmin()){
-      const members=departmentPeople();parents=parents.filter(task=>members.has(task.owner));
+      departmentMembers=departmentPeople();
+      parents=parents.filter(task=>departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)
+        ||(task.contextType==='regular_work'&&(dailyCache.get(task.id)||[]).some(child=>[...departmentMembers].some(member=>matchesPerson(child.assignedTo,member)))));
+      dailyParents=dailyParents.filter(task=>departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)
+        ||(dailyCache.get(task.id)||[]).some(child=>[...departmentMembers].some(member=>matchesPerson(child.assignedTo,member))));
     }
-    const items=parents.map(mappedParent);
-    const dailyParents=parents.filter(task=>task.contextType==='regular_work');
+    const items=parents.filter(task=>scope!=='department'||!isAdmin()||departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)).map(mappedParent);
+    const dailyItems=[];
     for(const parent of dailyParents){
       for(const child of dailyCache.get(parent.id)||[]){
-        if(child.archived===true)continue;
-        if(scope==='my'&&child.assignedTo!==uid())continue;
-        if(scope==='department'&&isAdmin()&&!departmentPeople().has(child.assignedTo))continue;
-        items.push({id:`daily:${parent.id}:${child.id}`,parentId:parent.id,kind:'daily',contextType:'regular',title:child.title||'Daily task',status:child.status||'Not Started',priority:child.priority||parent.priority||'',dueDate:child.date||'',completedAt:child.completedAt||'',createdAt:child.createdAt||'',assignedAt:child.createdAt||'',owner:child.assignedTo,source:'Regular Work',sourceDetail:[parent.regularFolderName,parent.regularCategoryName,'Daily Task'].filter(Boolean).join(' · '),record:child,parentTask:parent,waitingOn:''});
+        const item=dailyWorkModel.normalizeDailyTask(parent,child,state.users);
+        if(!item)continue;
+        dailyItems.push(item);
       }
     }
-    return items;
+    items.push(...dailyWorkModel.filterDailyItems(dailyItems,{
+      scope:scope==='department'&&isAdmin()?'department':scope,
+      allEmployees:allEmployeesSelected(),
+      employeeId:uid(),
+      departmentIds:departmentMembers?[...departmentMembers]:[],
+      employees:state.users
+    }));
+    return dailyWorkModel.uniqueWorkItems(items);
   }
   function syncDailyListeners(parents){
     const ids=[...new Set(parents.filter(task=>task.contextType==='regular_work').map(task=>task.id))].sort();
@@ -123,11 +143,16 @@
     if(key===dailyListenerKey)return;
     if(dailyListenerStop){dailyListenerStop();dailyListenerStop=null}
     dailyListenerKey=key;
+    dailyPendingIds=new Set(ids);dailyHydrationError='';
     if(!ids.length||!window.firebaseHub?.watchRegularWorkDailyTasks)return;
     dailyListenerStop=window.firebaseHub.watchRegularWorkDailyTasks(ids,(parentTaskId,records)=>{
-      dailyCache.set(parentTaskId,records||[]);dailyCacheTouched.set(parentTaskId,Date.now());
-      if(activeView==='dailywork'&&!shareMode)renderDailyWork();
+      dailyCache.set(parentTaskId,records||[]);dailyPendingIds.delete(parentTaskId);
+      if(activeView==='dailywork'&&!shareMode&&!dailyPendingIds.size)renderDailyWork();
       if(shareMode)renderShareSnapshot();
+    },(parentTaskId,error)=>{
+      if(parentTaskId)dailyPendingIds.delete(parentTaskId);else dailyPendingIds.clear();
+      dailyHydrationError=error?.message||'Some authorized Daily Tasks could not be loaded.';
+      if(activeView==='dailywork'&&!shareMode&&!dailyPendingIds.size)renderDailyWork();
     });
   }
   function completedInWindow(items,window=dateWindow()){
@@ -156,12 +181,12 @@
   }
   function authorizedApprovals(scope=scopeFilter,parents=parentTasksForScope(scope,workFilter)){
     const ids=new Set(parents.map(task=>task.id)),projects=new Set(parents.map(task=>task.project).filter(Boolean)),adminWide=isAdmin()&&!isAdminReviewingEmployee();
-    let records=(state.approvals||[]).filter(approval=>adminWide||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task))||(approval.project&&projects.has(approval.project))).filter(approval=>scope!=='my'||adminWide||approval.requestedBy===uid()||(approval.approvers||[]).includes(uid())||(approval.task&&ids.has(approval.task)));
+    let records=(state.approvals||[]).filter(approval=>adminWide||matchesPerson(approval.requestedBy)||(approval.approvers||[]).some(value=>matchesPerson(value))||(approval.task&&ids.has(approval.task))||(approval.project&&projects.has(approval.project))).filter(approval=>scope!=='my'||adminWide||matchesPerson(approval.requestedBy)||(approval.approvers||[]).some(value=>matchesPerson(value))||(approval.task&&ids.has(approval.task)));
     if(scope==='department'&&isAdmin()){
       const members=departmentPeople();
       records=records.filter(approval=>{
         const linked=(state.tasks||[]).find(task=>task.id===approval.task);
-        return linked?members.has(linked.owner):members.has(approval.requestedBy)||(approval.approvers||[]).some(id=>members.has(id));
+        return linked?[...members].some(id=>matchesPerson(linked.owner,id)):([...members].some(id=>matchesPerson(approval.requestedBy,id))||(approval.approvers||[]).some(approver=>[...members].some(id=>matchesPerson(approver,id))));
       });
     }
     return records;
@@ -183,10 +208,10 @@
       const eventType=event.contextType==='regular_work'||parent?.contextType==='regular_work'?'regular':event.project?'project':'personal';
       if(type==='regular'&&eventType!=='regular')return false;
       if(type==='project'&&eventType!=='project')return false;
-      if(scope==='my')return (event.participants||[]).includes(uid())||(parent&&parent.owner===uid());
+      if(scope==='my')return allEmployeesSelected()||(event.participants||[]).some(value=>matchesPerson(value))||(parent&&matchesPerson(parent.owner));
       if(scope==='department'&&isAdmin()){
         const members=departmentPeople();
-        return parent?members.has(parent.owner):(event.participants||[]).some(id=>members.has(id));
+        return parent?[...members].some(id=>matchesPerson(parent.owner,id)):(event.participants||[]).some(participant=>[...members].some(id=>matchesPerson(participant,id)));
       }
       return true;
     });
@@ -194,9 +219,9 @@
   function getApprovalGroups(approvals,window=dateWindow()){
     const active=approvals.filter(item=>!['Approved','Rejected','Cancelled'].includes(item.status)&&(inWindow(item.dueAt,window)||inWindow(item.requestedAt,window)));
     return {
-      requested:active.filter(item=>(item.approvers||[]).includes(uid())&&item.requestedBy!==uid()),
-      sent:active.filter(item=>item.requestedBy===uid()),
-      changes:approvals.filter(item=>item.status==='Changes Requested'&&inWindow(approvalChangeTime(item),window)&&(isAdmin()||item.requestedBy===uid()||(item.approvers||[]).includes(uid())))
+      requested:active.filter(item=>(allEmployeesSelected()?(item.approvers||[]).length>0:(item.approvers||[]).some(value=>matchesPerson(value))&&!matchesPerson(item.requestedBy))),
+      sent:active.filter(item=>allEmployeesSelected()||matchesPerson(item.requestedBy)),
+      changes:approvals.filter(item=>item.status==='Changes Requested'&&inWindow(approvalChangeTime(item),window)&&(allEmployeesSelected()||matchesPerson(item.requestedBy)||(item.approvers||[]).some(value=>matchesPerson(value))))
     };
   }
   function taskActivityEvent(item,predicate,window=dateWindow()){
@@ -237,13 +262,14 @@
   function employeeSnapshotMarkup(){
     if(!isAdmin())return '';
     const employees=(state.users||[]).filter(person=>person.id!==state.currentUser).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
-    return `<select class="dwp-select" id="dwpEmployeeSnapshot" aria-label="Employee snapshot"><option value="" ${snapshotEmployeeId?'':'selected'}>Admin View</option>${employees.map(person=>`<option value="${esc(person.id)}" ${snapshotEmployeeId===person.id?'selected':''}>${esc(person.name||person.email||person.id)}${person.active===false?' · Inactive':''}</option>`).join('')}</select>`;
+    return `<select class="dwp-select" id="dwpEmployeeSnapshot" aria-label="Employee snapshot"><option value="" ${snapshotEmployeeId?'':'selected'}>All Employees</option>${employees.map(person=>`<option value="${esc(person.id)}" ${snapshotEmployeeId===person.id?'selected':''}>${esc(person.name||person.email||person.id)}${person.active===false?' · Inactive':''}</option>`).join('')}</select>`;
   }
   function taskSource(item){return item.sourceDetail?`${item.source} · ${item.sourceDetail}`:item.source}
   function statusClass(status){if(status==='Completed')return 'completed';if(['Waiting','Blocked'].includes(status))return 'waiting';if(['Ready for Review','Changes Required'].includes(status))return 'review';if(['Cancelled','Canceled'].includes(status))return 'cancelled';return 'progress'}
-  function priorityClass(priority){return String(priority||'').toLowerCase()}
+  function priorityClass(priority){const classes={P0:'p0',P1:'p1',P2:'p2',P3:'p3'};return Object.hasOwn(classes,priority)?classes[priority]:'p2'}
   function taskRow(item){
-    return `<tr class="dwp-task-row" data-dwp-item="${esc(item.id)}"><td><button type="button" class="dwp-task-title" data-dwp-item="${esc(item.id)}">${esc(item.title)}</button></td><td><span class="dwp-source ${item.contextType}">${esc(taskSource(item))}</span></td><td><span class="dwp-priority ${priorityClass(item.priority)}">${esc(item.priority||'—')}</span></td><td><span class="dwp-status ${statusClass(item.status)}">${esc(item.status)}</span></td><td>${esc(shortDate(item.dueDate))}</td></tr>`;
+    const contextClass=item.contextType==='regular_work'?'regular':'project';
+    return `<tr class="dwp-task-row" data-dwp-item="${esc(item.id)}"><td><button type="button" class="dwp-task-title" data-dwp-item="${esc(item.id)}">${esc(item.title)}</button></td><td><span class="dwp-source ${contextClass}">${esc(taskSource(item))}</span></td><td><span class="dwp-priority ${priorityClass(item.priority)}">${esc(item.priority||'—')}</span></td><td><span class="dwp-status ${statusClass(item.status)}">${esc(item.status)}</span></td><td>${esc(shortDate(item.dueDate))}</td></tr>`;
   }
   function calendarSubtitle(event){
     const linked=event.regularWorkTaskId||event.task,parent=(state.tasks||[]).find(task=>task.id===linked),project=event.project?projectById(event.project):null;
@@ -266,18 +292,19 @@
     });
   }
   function activeItemsInWindow(items,window=dateWindow()){
-    return items.filter(item=>!isTerminal(item)&&((inWindow(item.dueDate,window))||(!item.dueDate&&isNewInWindow(item,window))));
+    return dailyWorkModel.getWorkMetrics(items,window,today()).table;
   }
   function isNewInWindow(item,window=dateWindow()){
+    if(item.kind==='daily')return taskCreatedOrAssigned(item,window);
     return inWindow(item.createdAt,window)||inWindow(item.assignedAt,window)||taskActivityEvent(item,event=>event.type==='Assignment'||event.type==='Task',window);
   }
   function calculateKpis(items,approvals,events,window=dateWindow()){
-    const due=dueInWindow(items,window),overdue=overdueItems(items,today()),completed=completedInWindow(items,window);
-    const pending=items.filter(item=>!isTerminal(item)&&item.dueDate&&item.dueDate<=window.end);
+    const workMetrics=dailyWorkModel.getWorkMetrics(items,window,today());
+    const {due,overdue,completed,pending}=workMetrics;
     const review=reviewItems(items,approvals,window),waiting=items.filter(item=>!isTerminal(item)&&(item.waitingOn||['Waiting','Blocked'].includes(item.status)));
     const cancelled=items.filter(item=>['Cancelled','Canceled'].includes(item.status)&&inWindow(cancellationTime(item),window)).concat(approvals.filter(item=>item.status==='Cancelled'&&inWindow(item.cancelledAt||item.completedAt,window)));
     const meetings=events.filter(event=>event.type==='meeting'&&inWindow(event.date,window));
-    const active=items.filter(item=>!isTerminal(item));
+    const active=workMetrics.active;
     const newToday=items.filter(item=>isNewInWindow(item,window));
     const controls=due.filter(item=>!isTerminal(item));
     const overdueDue=controls.filter(item=>itemDate(item)<today()&&overdueState(item));
@@ -290,7 +317,7 @@
     return `<div class="dwp-kpi-grid">${cards.map(([label,items,tone,help])=>`<button type="button" class="dwp-kpi ${tone}" data-dwp-kpi="${label}"><span>${label}</span><strong>${countPill(items)}</strong><small>${help}</small></button>`).join('')}</div>`;
   }
   function dayStats(items,events,date){
-    const due=items.filter(item=>itemDate(item)===date),completed=items.filter(item=>item.status==='Completed'&&String(item.completedAt||'').slice(0,10)===date),open=due.filter(overdueState),overdue=open.filter(item=>itemDate(item)<date),meetings=events.filter(event=>event.type==='meeting'&&event.date===date),critical=due.filter(item=>item.priority==='P0');
+    const due=items.filter(item=>itemDate(item)===date&&!['cancelled','canceled','archived'].includes(String(item.status||'').toLowerCase())),completed=items.filter(item=>item.status==='Completed'&&dailyWorkModel.dateOf(item.completedAt)===date),open=due.filter(overdueState),overdue=open.filter(item=>itemDate(item)<date),meetings=events.filter(event=>event.type==='meeting'&&event.date===date),critical=due.filter(item=>item.priority==='P0');
     return {due,completed,overdue,meetings,critical};
   }
   function renderComparison(items,events){
@@ -315,7 +342,12 @@
   }
   function renderMainPage(){
     const windowRange=dateWindow(),parents=parentTasksForScope(scopeFilter,workFilter);
-    syncDailyListeners(parents);
+    syncDailyListeners(dailyParentsForScope(scopeFilter,workFilter));
+    if(dailyPendingIds.size||dailyHydrationError){
+      setTitle(title,'DAILY WORK PERFORMANCE');document.body.classList.add('dwp-page-active');
+      el('content').innerHTML=`<main class="dwp-page"><section class="dwp-card"><div class="dwp-empty-inline">${esc(dailyHydrationError||'Loading authorized Daily Tasks…')}</div></section></main>`;
+      return null;
+    }
     const items=scopeItems(),approvals=authorizedApprovals(scopeFilter,parents),events=calendarEventsForScope(),metrics=calculateKpis(items,approvals,events,windowRange);
     const workloadStart=windowRange.start,workload=workloadValues(items,workloadStart,chartDays),chartMax=Math.max(1,...workload.map(day=>day.count));
     const approvalsGroups=getApprovalGroups(approvals,windowRange),active=activeItemsInWindow(items,windowRange),todayLabel=fullDate(today());
@@ -327,7 +359,7 @@
       ${renderKpiGrid(metrics)}
       <section class="dwp-two-col"><article class="dwp-card"><div class="dwp-section-head"><div><h3>Day-by-day comparison</h3><p>Yesterday, today and tomorrow at a glance.</p></div></div>${renderComparison(items,events)}</article><article class="dwp-card"><div class="dwp-section-head"><div><h3>Approvals &amp; reviews</h3><p>What needs a decision in this date range.</p></div><button type="button" class="dwp-text-button" data-dwp-open-view="approvals">View approvals →</button></div>${renderApprovalCard(approvalsGroups)}</article></section>
       <section class="dwp-card"><div class="dwp-section-head"><div><h3>Upcoming workload</h3><p>Task count by day. Click a bar to inspect that date.</p></div><div class="dwp-range-switch" role="group" aria-label="Workload range">${[7,14,30].map(days=>`<button type="button" class="${chartDays===days?'active':''}" data-dwp-range="${days}">${days} Days</button>`).join('')}</div></div><div class="dwp-chart-scale" style="--chart-max:${chartMax}">${renderWorkloadChart(items,workloadStart,chartDays)}</div></section>
-      <section class="dwp-two-col dwp-work-planner"><article class="dwp-card"><div class="dwp-section-head"><div><h3>Today's active work</h3><p>Click any row for the full task view.</p></div><button type="button" class="dwp-text-button" data-dwp-kpi="Active Load">View all →</button></div>${renderTaskTable(items,windowRange)}</article><article class="dwp-card"><div class="dwp-section-head"><div><h3>Planner snapshot</h3><p>Meetings and work blocks.</p></div><button type="button" class="dwp-text-button" data-dwp-open-view="planner">Open Planner →</button></div>${renderPlannerTimeline(events,windowRange)}</article></section>
+      <section class="dwp-two-col dwp-work-planner"><article class="dwp-card"><div class="dwp-section-head"><div><h3>Today's work</h3><p>Click any row for the full task view.</p></div><button type="button" class="dwp-text-button" data-dwp-kpi="Active Load">View all →</button></div>${renderTaskTable(items,windowRange)}</article><article class="dwp-card"><div class="dwp-section-head"><div><h3>Planner snapshot</h3><p>Meetings and work blocks.</p></div><button type="button" class="dwp-text-button" data-dwp-open-view="planner">Open Planner →</button></div>${renderPlannerTimeline(events,windowRange)}</article></section>
       <footer class="dwp-footnote">Generated from authorized live Execution Hub data · Date range: ${esc(shortDate(windowRange.start))}–${esc(shortDate(windowRange.end))}</footer>
     </main>`;
     bindMainPage(items,approvals,events,metrics,windowRange,approvalsGroups);
@@ -352,7 +384,7 @@
   }
   function closeDrill(){document.getElementById('dwpDrillBackdrop')?.classList.remove('open')}
   function goToView(view){activeProject=null;activeView=view;document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===view));render()}
-  function rangeItemsForDay(items,date){return items.filter(item=>itemDate(item)===date&&!isTerminal(item))}
+  function rangeItemsForDay(items,date){return items.filter(item=>(itemDate(item)===date&&!isTerminal(item))||(item.status==='Completed'&&dailyWorkModel.dateOf(item.completedAt)===date))}
   function bindMainPage(items,approvals,events,metrics,windowRange,approvalGroups){
     document.querySelectorAll('[data-dwp-date]').forEach(button=>button.onclick=()=>{dateFilter=button.dataset.dwpDate;renderDailyWork()});
     const employeeSelect=document.getElementById('dwpEmployeeSnapshot');
@@ -428,6 +460,6 @@
     if(activeView==='dailywork'){renderDailyWork();wireDynamic();return}
     document.body.classList.remove('dwp-page-active');stopDailyWatchers();return baseRender(search);
   };
-  function stopDailyWatchers(){if(dailyListenerStop){dailyListenerStop();dailyListenerStop=null}dailyListenerKey=''}
+  function stopDailyWatchers(){if(dailyListenerStop){dailyListenerStop();dailyListenerStop=null}dailyListenerKey='';dailyPendingIds=new Set()}
   render();
 })();

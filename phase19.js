@@ -239,6 +239,7 @@
   function dailyTasksSection(parentTask,{loading=false,error=''}={}){
     const records=(dailyTasksByParent.get(parentTask.id)||[]).filter(item=>item.archived!==true).sort((a,b)=>String(a.date||'').localeCompare(String(b.date||''))||String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
     const completed=records.filter(item=>item.status==='Completed').length,canManage=dailyTaskController(parentTask);
+    const allCompleted=records.length>0&&completed===records.length;
     const groups=new Map();records.forEach(item=>{const key=item.date||'';if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item)});
     const groupMarkup=[...groups.entries()].map(([date,items])=>{
       const today=date===new Date().toLocaleDateString('en-CA');
@@ -248,8 +249,7 @@
       }).join('')}</div></div>`;
     }).join('');
     const percentage=records.length?Math.round(completed/records.length*100):0;
-    const allComplete=records.length>0&&completed===records.length;
-    return `<section class="drawer-section rw-daily-section" data-parent-task-id="${esc(parentTask.id)}"><div class="rw-daily-heading"><div><span class="rw-daily-kicker">DAILY EXECUTION</span><h4>Daily Tasks</h4><p>${completed} of ${records.length} completed · ${percentage}%</p></div>${canManage?`<button type="button" class="btn btn-soft rw-daily-add" data-add-daily-task="${esc(parentTask.id)}">+ Add Daily Task</button>`:''}</div>${records.length?`<div class="rw-daily-progress" role="progressbar" aria-valuenow="${percentage}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percentage}%"></span></div>`:''}${allComplete?'<div class="rw-daily-complete-note"><span>✓</span><div><strong>All Daily Tasks Completed</strong><small>Parent task status remains separate until you update or send it for review.</small></div></div>':''}${loading?'<div class="rw-daily-empty">Loading Daily Tasks…</div>':error?`<div class="rw-daily-empty error">${esc(error)}</div>`:records.length?groupMarkup:'<div class="rw-daily-empty"><strong>No Daily Tasks yet</strong><span>Break this parent task into clear day-by-day actions.</span></div>'}</section>`;
+    return `<section class="drawer-section rw-daily-section" data-parent-task-id="${esc(parentTask.id)}"><div class="rw-daily-heading"><div><h4>Daily Tasks</h4><p>${completed} of ${records.length} completed</p></div>${canManage?`<button type="button" class="btn btn-soft" data-add-daily-task="${esc(parentTask.id)}">+ Add Daily Task</button>`:''}</div>${records.length?`<div class="rw-daily-progress" role="progressbar" aria-valuenow="${percentage}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percentage}%"></span></div>`:''}${loading?'<div class="rw-daily-empty">Loading Daily Tasks…</div>':error?`<div class="rw-daily-empty error">${esc(error)}</div>`:records.length?groupMarkup:'<div class="rw-daily-empty">No Daily Tasks yet.</div>'}</section>`;
   }
   function refreshDailyTasksSection(parentTask,options={}){
     const current=document.querySelector('.rw-daily-section');
@@ -296,7 +296,7 @@
       const assigned=people.find(account=>account.id===assignedTo);
       if(!assigned||!new Set([...(parentTask.accessUserIds||[]),parentTask.owner,parentTask.createdBy].filter(Boolean)).has(assignedTo))return toast('Choose an active person who already has access to this parent task.');
       const status=String(fields.get('status')||existing?.status||'Not Started'),now=new Date().toISOString();
-      const dailyTask={...(existing||{}),id:existing?.id||uniqueId('rwd'),parentTaskId:parentTask.id,title,date,assignedTo,status,priority:manager?String(fields.get('priority')||parentTask.priority||'P2'):existing.priority,notes:manager?String(fields.get('notes')||'').trim():existing.notes||'',createdBy:existing?.createdBy||state.currentUser,createdByUid:existing?.createdByUid||authUid(),createdAt:existing?.createdAt||now,completedAt:status==='Completed'?(existing?.completedAt||now):null,archived:existing?.archived===true,archivedAt:existing?.archivedAt||null,archivedByUid:existing?.archivedByUid||null};
+      const dailyTask={...(existing||{}),id:existing?.id||uniqueId('rwd'),parentTaskId:parentTask.id,title,date,assignedTo,status,priority:manager?String(fields.get('priority')||parentTask.priority||'P2'):existing.priority,notes:manager?String(fields.get('notes')||'').trim():existing.notes||'',createdBy:existing?.createdBy||state.currentUser,createdByUid:existing?.createdByUid||authUid(),createdAt:existing?.createdAt||now,completedAt:status==='Completed'?(existing?.status==='Completed'&&existing?.completedAt?existing.completedAt:now):null,archived:existing?.archived===true,archivedAt:existing?.archivedAt||null,archivedByUid:existing?.archivedByUid||null};
       try{
         await window.firebaseHub.saveRegularWorkDailyTask(parentTask.id,dailyTask);
         const records=dailyTasksByParent.get(parentTask.id)||[],index=records.findIndex(item=>item.id===dailyTask.id);
@@ -322,7 +322,7 @@
     document.querySelectorAll('[data-edit-daily-task]').forEach(button=>button.onclick=()=>{const existing=(dailyTasksByParent.get(parentTask.id)||[]).find(item=>item.id===button.dataset.editDailyTask);if(existing)openDailyTaskForm(parentTask,existing)});
     document.querySelectorAll('[data-toggle-daily-task]').forEach(button=>button.onclick=async()=>{
       const existing=(dailyTasksByParent.get(parentTask.id)||[]).find(item=>item.id===button.dataset.toggleDailyTask);if(!existing||!canEditDailyTask(parentTask,existing)||existing.archived)return;
-      const status=existing.status==='Completed'?'Not Started':'Completed',now=new Date().toISOString(),updated={...existing,status,completedAt:status==='Completed'?(existing.completedAt||now):null};
+      const status=existing.status==='Completed'?'Not Started':'Completed',now=new Date().toISOString(),updated={...existing,status,completedAt:status==='Completed'?now:null};
       try{await window.firebaseHub.saveRegularWorkDailyTask(parentTask.id,updated);dailyTasksByParent.set(parentTask.id,(dailyTasksByParent.get(parentTask.id)||[]).map(item=>item.id===updated.id?updated:item));notifyDailyTasksUpdated(parentTask.id);const action=status==='Completed'?`completed daily task ${existing.title}`:existing.status==='Completed'?`reopened daily task ${existing.title}`:`updated daily task ${existing.title}`;log(state.currentUser,parentTask.project,parentTask.id,'Daily Task',action,`${existing.status} → ${status}`);await save();refreshDailyTasksSection(parentTask)}catch(error){console.error('Could not update Daily Task status:',error);toast(error?.message||'Daily Task status could not be updated.')}
     });
     document.querySelectorAll('[data-archive-daily-task]').forEach(button=>button.onclick=async()=>{
@@ -385,6 +385,8 @@
     const commentInput=el('newComment'),commentButton=el('addComment');if(commentInput)commentInput.placeholder='Add a comment...';if(commentButton)commentButton.textContent='Add';
     const commentBox=commentSection?.querySelector('.comment-box');if(commentBox)commentSection.appendChild(commentBox);
     if(activitySection){activitySection.classList.add('rw-activity-section');const heading=activitySection.querySelector('h4');if(heading)heading.textContent='Activity'}
+    actionSection.insertAdjacentHTML('afterend',dailyTasksSection(parentTask,{loading:true}));
+    loadDailyTasks(parentTask);
   };
   el('closeDrawer').addEventListener('click',()=>document.body.classList.remove('regular-task-drawer'));
   el('drawerBackdrop').addEventListener('click',()=>document.body.classList.remove('regular-task-drawer'));

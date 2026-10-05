@@ -49,6 +49,8 @@ let activeProjectTab = 'overview';
 const today = new Date();
 
 const el = id => document.getElementById(id);
+const escapeHtml = window.ExecutionHubSecurity?.escapeHtml || (value => String(value ?? '').replace(/[&<>\"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char])));
+window.executionHubEscapeHtml = escapeHtml;
 const user = id => state.users.find(u=>u.id===id) || {name:id,initials:'?',role:''};
 const project = id => state.projects.find(p=>p.id===id);
 const task = id => state.tasks.find(t=>t.id===id);
@@ -83,8 +85,8 @@ const fmtTime = d => new Date(d).toLocaleString('en-IN',{day:'2-digit',month:'sh
 const daysDiff = d => Math.ceil((new Date(d+'T23:59:59')-today)/86400000);
 const isOverdue = t => !['Completed','Ready for Review'].includes(t.status) && daysDiff(t.currentDue) < 0;
 const healthLabel = h => ({'on-track':'On Track','at-risk':'At Risk','delayed':'Delayed'})[h] || h;
-const avatar = uid => `<div class="avatar">${user(uid).initials}</div>`;
-const person = uid => `<div class="person">${avatar(uid)}<div><strong>${user(uid).name}</strong><div class="subtle">${user(uid).role}</div></div></div>`;
+const avatar = uid => `<div class="avatar">${escapeHtml(user(uid).initials)}</div>`;
+const person = uid => `<div class="person">${avatar(uid)}<div><strong>${escapeHtml(user(uid).name)}</strong><div class="subtle">${escapeHtml(user(uid).role)}</div></div></div>`;
 const statusClass = s => {
   if(s==='Ready for Review'||s==='Changes Required') return 'review';
   if(s==='Waiting'||s==='Blocked') return 'waiting';
@@ -92,8 +94,8 @@ const statusClass = s => {
   if(s==='Overdue') return 'overdue';
   return 'on-track';
 };
-const statusPill = s => `<span class="status-pill ${statusClass(s)}">${s}</span>`;
-const priorityPill = p => `<span class="priority-pill ${p.toLowerCase()}">${p}</span>`;
+const statusPill = s => `<span class="status-pill ${statusClass(s)}">${escapeHtml(s)}</span>`;
+const priorityPill = p => {const value=String(p??'');return `<span class="priority-pill ${escapeHtml(value.toLowerCase())}">${escapeHtml(value)}</span>`};
 
 function init(){
   populateUserSelect();
@@ -102,7 +104,7 @@ function init(){
 }
 
 function populateUserSelect(){
-  el('userSelect').innerHTML = state.users.map(u=>`<option value="${u.id}" ${u.id===state.currentUser?'selected':''}>${u.name}</option>`).join('');
+  el('userSelect').innerHTML = state.users.map(u=>`<option value="${escapeHtml(u.id)}" ${u.id===state.currentUser?'selected':''}>${escapeHtml(u.name)}</option>`).join('');
   updateUserBadge();
 }
 function updateUserBadge(){
@@ -182,17 +184,18 @@ function renderDashboard(){
 function projectRow(p){
   const over=state.tasks.filter(t=>t.project===p.id&&isOverdue(t)).length;
   const due=daysDiff(p.launch);
-  return `<div class="project-card" data-project="${p.id}">
-    <div><div class="project-title">${p.name}</div><div class="project-meta">${p.category} • ${p.code} • ${over} overdue task${over===1?'':'s'}</div></div>
-    <div class="progress-wrap"><div class="progress"><span style="width:${p.progress}%"></span></div><div class="percent">${p.progress}%</div></div>
-    <div><span class="status-pill ${p.health}">${healthLabel(p.health)}</span></div>
+  const progress=Math.max(0,Math.min(100,Number(p.progress)||0));
+  return `<div class="project-card" data-project="${escapeHtml(p.id)}">
+    <div><div class="project-title">${escapeHtml(p.name)}</div><div class="project-meta">${escapeHtml(p.category)} • ${escapeHtml(p.code)} • ${over} overdue task${over===1?'':'s'}</div></div>
+    <div class="progress-wrap"><div class="progress"><span style="width:${progress}%"></span></div><div class="percent">${progress}%</div></div>
+    <div><span class="status-pill ${escapeHtml(p.health)}">${escapeHtml(healthLabel(p.health))}</span></div>
     <div class="due ${due<0?'overdue':''}"><span>Launch</span><strong>${fmtDate(p.launch)}</strong></div>
   </div>`;
 }
 function attentionItems(){
   const items=[];
-  state.approvals.slice(0,2).forEach(a=>{const t=task(a.task);if(!t)return;const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${a.type}: ${t.title}</strong><span>${user(a.requestedBy).name} • ${context}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Review →</button></div></div>`)});
-  state.tasks.filter(isOverdue).slice(0,2).forEach(t=>{const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${t.title}</strong><span>Overdue • ${user(t.owner).name} • ${context}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${t.id}">Open →</button></div></div>`)});
+  state.approvals.slice(0,2).forEach(a=>{const t=task(a.task);if(!t)return;const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${escapeHtml(a.type)}: ${escapeHtml(t.title)}</strong><span>${escapeHtml(user(a.requestedBy).name)} • ${escapeHtml(context)}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${escapeHtml(t.id)}">Review →</button></div></div>`)});
+  state.tasks.filter(isOverdue).slice(0,2).forEach(t=>{const p=t.project?project(t.project):null,context=p?.name||(t.contextType==='regular_work'?'Regular Work':'Project');items.push(`<div class="attention-item"><strong>${escapeHtml(t.title)}</strong><span>Overdue • ${escapeHtml(user(t.owner).name)} • ${escapeHtml(context)}</span><div class="row">${priorityPill(t.priority)}<button class="link-btn" data-task="${escapeHtml(t.id)}">Open →</button></div></div>`)});
   return items.join('')||`<div class="empty"><strong>Nothing urgent</strong>Your desk is clear.</div>`;
 }
 
@@ -201,13 +204,13 @@ function renderProjects(search=''){
   const list=state.projects.filter(p=>!search||`${p.name} ${p.category} ${p.code}`.toLowerCase().includes(search));
   el('content').innerHTML=`
     <div class="section-row" style="margin-top:0"><div><h2>Units, Brands & New Verticals</h2><p>One portfolio, shared execution.</p></div><div class="filters"><select class="select"><option>All Categories</option><option>Unit</option><option>Brand</option><option>Vertical</option><option>System</option></select><button class="btn btn-soft" id="newProjectBtn">+ New Project</button></div></div>
-    <div class="card-grid">${list.map(p=>`<div class="big-card" data-project="${p.id}">
-      <div class="topline"><div><div class="eyebrow">${p.category.toUpperCase()} • ${p.code}</div><h3 style="margin-top:6px">${p.name}</h3></div><span class="status-pill ${p.health}">${healthLabel(p.health)}</span></div>
-      <p>${p.description}</p>
-      <div class="progress-wrap"><div class="progress"><span style="width:${p.progress}%"></span></div><div class="percent">${p.progress}%</div></div>
-      <div class="workstreams">${projectWorkstreams(p).slice(0,4).map(w=>`<div class="workstream-row"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div>
+    <div class="card-grid">${list.map(p=>{const progress=Math.max(0,Math.min(100,Number(p.progress)||0));return `<div class="big-card" data-project="${escapeHtml(p.id)}">
+      <div class="topline"><div><div class="eyebrow">${escapeHtml(p.category).toUpperCase()} • ${escapeHtml(p.code)}</div><h3 style="margin-top:6px">${escapeHtml(p.name)}</h3></div><span class="status-pill ${escapeHtml(p.health)}">${escapeHtml(healthLabel(p.health))}</span></div>
+      <p>${escapeHtml(p.description)}</p>
+      <div class="progress-wrap"><div class="progress"><span style="width:${progress}%"></span></div><div class="percent">${progress}%</div></div>
+      <div class="workstreams">${projectWorkstreams(p).slice(0,4).map(w=>{const value=Math.max(0,Math.min(100,Number(w.progress)||0));return `<div class="workstream-row"><span>${escapeHtml(w.name)}</span><div class="tiny-progress"><i style="width:${value}%"></i></div><span>${value}%</span></div>`}).join('')}</div>
       <div style="display:flex;justify-content:space-between;margin-top:15px"><span class="subtle">Launch ${fmtDateFull(p.launch)}</span><button class="link-btn">Open project →</button></div>
-    </div>`).join('')}</div>`;
+    </div>`}).join('')}</div>`;
 }
 
 function renderProject(pid){
@@ -223,7 +226,7 @@ function renderProject(pid){
   el('content').innerHTML=`
     <button class="link-btn" id="backProjects" style="margin-bottom:12px">← Back to Projects</button>
     <div class="project-hero">
-      <div class="project-hero-top"><div><div class="eyebrow">${p.category.toUpperCase()} • ${p.code}</div><h2>${p.name}</h2><p>${p.description}</p></div><span class="status-pill ${p.health}">${healthLabel(p.health)}</span></div>
+      <div class="project-hero-top"><div><div class="eyebrow">${escapeHtml(p.category).toUpperCase()} • ${escapeHtml(p.code)}</div><h2>${escapeHtml(p.name)}</h2><p>${escapeHtml(p.description)}</p></div><span class="status-pill ${escapeHtml(p.health)}">${escapeHtml(healthLabel(p.health))}</span></div>
       <div class="project-stats"><div class="project-stat"><span>Readiness</span><strong>${p.progress}%</strong></div><div class="project-stat"><span>Launch target</span><strong>${fmtDate(p.launch)}</strong></div><div class="project-stat"><span>Open tasks</span><strong>${tasks.filter(t=>t.status!=='Completed').length}</strong></div><div class="project-stat"><span>Overdue</span><strong style="color:var(--red)">${overdue}</strong></div><div class="project-stat"><span>Awaiting review</span><strong>${ready}</strong></div></div>
     </div>
     <div class="tabs" role="tablist">${tabs.map(tab=>`<button class="tab ${activeProjectTab===tab?'active':''}" data-project-tab="${tab}" role="tab" aria-selected="${activeProjectTab===tab}">${labels[tab]}</button>`).join('')}</div>
@@ -245,11 +248,11 @@ function renderProjectOverview(p,tasks){
   const critical=tasks.filter(t=>t.priority==='P0'&&t.status!=='Completed').sort((a,b)=>a.currentDue.localeCompare(b.currentDue));
   return `
     <div class="grid-2">
-      <div class="panel"><div class="panel-head"><div><h3>Workstreams</h3><span>Launch readiness by area</span></div><button class="link-btn" data-project-tab="workstreams">View details →</button></div><div class="panel-body"><div class="workstreams">${projectWorkstreams(p).map(w=>`<div class="workstream-row" style="grid-template-columns:1fr 180px 40px"><span>${w.name}</span><div class="tiny-progress"><i style="width:${w.progress}%"></i></div><span>${w.progress}%</span></div>`).join('')}</div></div></div>
+      <div class="panel"><div class="panel-head"><div><h3>Workstreams</h3><span>Launch readiness by area</span></div><button class="link-btn" data-project-tab="workstreams">View details →</button></div><div class="panel-body"><div class="workstreams">${projectWorkstreams(p).map(w=>{const progress=Math.max(0,Math.min(100,Number(w.progress)||0));return `<div class="workstream-row" style="grid-template-columns:1fr 180px 40px"><span>${escapeHtml(w.name)}</span><div class="tiny-progress"><i style="width:${progress}%"></i></div><span>${progress}%</span></div>`}).join('')}</div></div></div>
       <div class="panel"><div class="panel-head"><div><h3>Project pulse</h3><span>Current risk indicators</span></div></div><div class="panel-body"><div class="attention-list"><div class="attention-item"><strong>${overdue} overdue task${overdue===1?'':'s'}</strong><span>Original commitments remain visible.</span></div><div class="attention-item"><strong>${ready} item${ready===1?'':'s'} awaiting review</strong><span>Ready for manager approval.</span></div><div class="attention-item"><strong>${tasks.filter(t=>t.waitingOn).length} dependencies</strong><span>Waiting-on ownership is recorded.</span></div></div></div></div>
     </div>
     <div class="section-row"><div><h2>Critical & launch-sensitive work</h2><p>P0 tasks that can directly affect delivery.</p></div><button class="link-btn" data-project-tab="tasks">See all tasks →</button></div>
-    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Owner</th><th>Status</th><th>Due</th><th>Next Action</th></tr></thead><tbody>${critical.map(t=>`<tr><td><button class="task-link" data-task="${t.id}">${t.title}</button><div class="subtle">${t.workstream} • ${t.deliverable}</div></td><td>${person(t.owner)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td>${fmtDate(t.currentDue)}</td><td>${t.next}</td></tr>`).join('')||`<tr><td colspan="5"><div class="empty"><strong>No critical tasks</strong>No open P0 work in this project.</div></td></tr>`}</tbody></table></div></div>
+    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Owner</th><th>Status</th><th>Due</th><th>Next Action</th></tr></thead><tbody>${critical.map(t=>`<tr><td><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><div class="subtle">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div></td><td>${person(t.owner)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td>${fmtDate(t.currentDue)}</td><td>${escapeHtml(t.next)}</td></tr>`).join('')||`<tr><td colspan="5"><div class="empty"><strong>No critical tasks</strong>No open P0 work in this project.</div></td></tr>`}</tbody></table></div></div>
     <div class="section-row"><div><h2>Project task board</h2><p>Click any card to open full history and controls.</p></div></div>
     <div class="kanban">${['Not Started','In Progress','Waiting','Ready for Review'].map(s=>kanbanColumn(s,tasks.filter(t=>t.status===s || (s==='Waiting'&&t.status==='Blocked') || (s==='Ready for Review'&&t.status==='Changes Required')))).join('')}</div>`;
 }
@@ -261,40 +264,41 @@ function renderProjectWorkstreams(p,tasks){
       const open=wt.filter(t=>t.status!=='Completed').length;
       const over=wt.filter(isOverdue).length;
       const owners=[...new Set(wt.map(t=>t.owner))];
-      return `<div class="workstream-card"><div class="workstream-card-head"><div><div class="eyebrow">WORKSTREAM</div><h3>${w.name}</h3></div><strong>${w.progress}%</strong></div><div class="progress"><span style="width:${w.progress}%"></span></div><div class="workstream-metrics"><span><b>${wt.length}</b> Tasks</span><span><b>${open}</b> Open</span><span class="${over?'risk-text':''}"><b>${over}</b> Overdue</span></div><div class="avatar-stack">${owners.length?owners.map(uid=>`<span title="${user(uid).name}">${user(uid).initials}</span>`).join(''):'<em>No assigned tasks yet</em>'}</div>${wt.length?`<div class="workstream-task-list">${wt.slice(0,3).map(t=>`<button class="mini-task" data-task="${t.id}"><span>${t.title}</span>${priorityPill(t.priority)}</button>`).join('')}${wt.length>3?`<div class="subtle">+${wt.length-3} more task${wt.length-3===1?'':'s'}</div>`:''}</div>`:`<div class="empty compact"><strong>No tasks yet</strong>This workstream is ready for task planning.</div>`}</div>`;
+      const progress=Math.max(0,Math.min(100,Number(w.progress)||0));
+      return `<div class="workstream-card"><div class="workstream-card-head"><div><div class="eyebrow">WORKSTREAM</div><h3>${escapeHtml(w.name)}</h3></div><strong>${progress}%</strong></div><div class="progress"><span style="width:${progress}%"></span></div><div class="workstream-metrics"><span><b>${wt.length}</b> Tasks</span><span><b>${open}</b> Open</span><span class="${over?'risk-text':''}"><b>${over}</b> Overdue</span></div><div class="avatar-stack">${owners.length?owners.map(uid=>`<span title="${escapeHtml(user(uid).name)}">${escapeHtml(user(uid).initials)}</span>`).join(''):'<em>No assigned tasks yet</em>'}</div>${wt.length?`<div class="workstream-task-list">${wt.slice(0,3).map(t=>`<button class="mini-task" data-task="${escapeHtml(t.id)}"><span>${escapeHtml(t.title)}</span>${priorityPill(t.priority)}</button>`).join('')}${wt.length>3?`<div class="subtle">+${wt.length-3} more task${wt.length-3===1?'':'s'}</div>`:''}</div>`:`<div class="empty compact"><strong>No tasks yet</strong>This workstream is ready for task planning.</div>`}</div>`;
     }).join('')}</div>`;
 }
 
 function renderProjectTasks(p,tasks){
   const workstreams=[...new Set(tasks.map(t=>t.workstream))].sort();
-  return `<div class="section-row" style="margin-top:0"><div><h2>All project tasks</h2><p>${tasks.length} tasks across ${workstreams.length} workstreams.</p></div><div class="filters"><select class="select" id="projectWorkstreamFilter"><option value="">All Workstreams</option>${workstreams.map(w=>`<option value="${w}">${w}</option>`).join('')}</select><select class="select" id="projectStatusFilter"><option value="">All Statuses</option>${[...new Set(tasks.map(t=>t.status))].map(st=>`<option value="${st}">${st}</option>`).join('')}</select></div></div>
+  return `<div class="section-row" style="margin-top:0"><div><h2>All project tasks</h2><p>${tasks.length} tasks across ${workstreams.length} workstreams.</p></div><div class="filters"><select class="select" id="projectWorkstreamFilter"><option value="">All Workstreams</option>${workstreams.map(w=>`<option value="${escapeHtml(w)}">${escapeHtml(w)}</option>`).join('')}</select><select class="select" id="projectStatusFilter"><option value="">All Statuses</option>${[...new Set(tasks.map(t=>t.status))].map(st=>`<option value="${escapeHtml(st)}">${escapeHtml(st)}</option>`).join('')}</select></div></div>
     <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Owner</th><th>Priority</th><th>Status</th><th>Progress</th><th>Due</th><th>Next Action</th></tr></thead><tbody id="projectTaskRows">${tasks.map(projectTaskRow).join('')}</tbody></table></div></div>`;
 }
-function projectTaskRow(t){return `<tr data-task-row="${t.id}" data-workstream="${t.workstream}" data-status="${t.status}"><td><button class="task-link" data-task="${t.id}">${t.title}</button><div class="subtle">${t.workstream} • ${t.deliverable}</div></td><td>${person(t.owner)}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td><div class="progress-wrap"><div class="progress"><span style="width:${t.progress}%"></span></div><div class="percent">${t.progress}%</div></div></td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${t.next}</td></tr>`}
+function projectTaskRow(t){const progress=Math.max(0,Math.min(100,Number(t.progress)||0));return `<tr data-task-row="${escapeHtml(t.id)}" data-workstream="${escapeHtml(t.workstream)}" data-status="${escapeHtml(t.status)}"><td><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><div class="subtle">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div></td><td>${person(t.owner)}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td><div class="progress-wrap"><div class="progress"><span style="width:${progress}%"></span></div><div class="percent">${progress}%</div></div></td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${escapeHtml(t.next)}</td></tr>`}
 
 function renderProjectTimeline(p,tasks){
   const sorted=[...tasks].sort((a,b)=>a.currentDue.localeCompare(b.currentDue));
   return `<div class="section-row" style="margin-top:0"><div><h2>Delivery timeline</h2><p>Original commitments, current deadlines and launch target in sequence.</p></div></div>
     <div class="panel"><div class="panel-body"><div class="timeline-list">${sorted.map(t=>{
       const overdue=isOverdue(t); const done=t.status==='Completed';
-      return `<div class="timeline-item ${overdue?'is-overdue':''} ${done?'is-done':''}"><div class="timeline-marker"></div><div class="timeline-date"><strong>${fmtDate(t.currentDue)}</strong>${t.originalDue!==t.currentDue?`<span>Original ${fmtDate(t.originalDue)}</span>`:''}</div><div class="timeline-copy"><button class="task-link" data-task="${t.id}">${t.title}</button><span>${t.workstream} • ${user(t.owner).name}</span></div><div>${priorityPill(t.priority)} ${statusPill(overdue?'Overdue':t.status)}</div></div>`;
-    }).join('')}<div class="timeline-item launch-milestone"><div class="timeline-marker"></div><div class="timeline-date"><strong>${fmtDate(p.launch)}</strong></div><div class="timeline-copy"><strong>Launch target</strong><span>${p.name}</span></div><span class="status-pill ${p.health}">${healthLabel(p.health)}</span></div></div></div></div>`;
+      return `<div class="timeline-item ${overdue?'is-overdue':''} ${done?'is-done':''}"><div class="timeline-marker"></div><div class="timeline-date"><strong>${fmtDate(t.currentDue)}</strong>${t.originalDue!==t.currentDue?`<span>Original ${fmtDate(t.originalDue)}</span>`:''}</div><div class="timeline-copy"><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><span>${escapeHtml(t.workstream)} • ${escapeHtml(user(t.owner).name)}</span></div><div>${priorityPill(t.priority)} ${statusPill(overdue?'Overdue':t.status)}</div></div>`;
+    }).join('')}<div class="timeline-item launch-milestone"><div class="timeline-marker"></div><div class="timeline-date"><strong>${fmtDate(p.launch)}</strong></div><div class="timeline-copy"><strong>Launch target</strong><span>${escapeHtml(p.name)}</span></div><span class="status-pill ${escapeHtml(p.health)}">${escapeHtml(healthLabel(p.health))}</span></div></div></div></div>`;
 }
 
 function renderProjectTeam(p,tasks){
   const ids=[...new Set([p.owner,...tasks.map(t=>t.owner),...tasks.map(t=>t.reviewer)].filter(Boolean))];
   return `<div class="section-row" style="margin-top:0"><div><h2>Project team</h2><p>People currently responsible for this initiative.</p></div></div><div class="team-grid">${ids.map(uid=>{
     const u=user(uid); const assigned=tasks.filter(t=>t.owner===uid); const open=assigned.filter(t=>t.status!=='Completed').length; const over=assigned.filter(isOverdue).length; const wait=assigned.filter(t=>t.waitingOn).length;
-    return `<div class="team-card">${avatar(uid)}<strong>${u.name}</strong><div class="role">${u.role} • ${u.dept||''}</div><div class="team-numbers"><div class="team-num"><b>${open}</b><span>OPEN</span></div><div class="team-num"><b>${over}</b><span>OVERDUE</span></div><div class="team-num"><b>${wait}</b><span>WAITING</span></div></div>${assigned.length?`<div class="team-task-preview">${assigned.slice(0,3).map(t=>`<button class="mini-task" data-task="${t.id}"><span>${t.title}</span></button>`).join('')}</div>`:'<div class="subtle" style="margin-top:12px">Reviewer / project owner</div>'}</div>`;
+    return `<div class="team-card">${avatar(uid)}<strong>${escapeHtml(u.name)}</strong><div class="role">${escapeHtml(u.role)} • ${escapeHtml(u.dept||'')}</div><div class="team-numbers"><div class="team-num"><b>${open}</b><span>OPEN</span></div><div class="team-num"><b>${over}</b><span>OVERDUE</span></div><div class="team-num"><b>${wait}</b><span>WAITING</span></div></div>${assigned.length?`<div class="team-task-preview">${assigned.slice(0,3).map(t=>`<button class="mini-task" data-task="${escapeHtml(t.id)}"><span>${escapeHtml(t.title)}</span></button>`).join('')}</div>`:'<div class="subtle" style="margin-top:12px">Reviewer / project owner</div>'}</div>`;
   }).join('')}</div>`;
 }
 
 function renderProjectActivity(p,tasks){
   const history=state.activity.filter(a=>a.project===p.id);
-  return `<div class="section-row" style="margin-top:0"><div><h2>Project activity</h2><p>Immutable history of meaningful changes in ${p.name}.</p></div><span class="tag">${history.length} recorded events</span></div><div class="panel"><div class="panel-body"><div class="activity">${history.map(activityItem).join('')||`<div class="empty"><strong>No activity yet</strong>Changes made inside this project will appear here.</div>`}</div></div></div>`;
+  return `<div class="section-row" style="margin-top:0"><div><h2>Project activity</h2><p>Immutable history of meaningful changes in ${escapeHtml(p.name)}.</p></div><span class="tag">${history.length} recorded events</span></div><div class="panel"><div class="panel-body"><div class="activity">${history.map(activityItem).join('')||`<div class="empty"><strong>No activity yet</strong>Changes made inside this project will appear here.</div>`}</div></div></div>`;
 }
 
-function kanbanColumn(status,tasks){return `<div class="kanban-col"><div class="kanban-head">${status}<span>${tasks.length}</span></div>${tasks.map(t=>`<div class="kanban-card" data-task="${t.id}"><strong>${t.title}</strong><div class="meta">${t.workstream} • ${t.deliverable}</div><div class="foot">${priorityPill(t.priority)}<div class="mini-avatar">${user(t.owner).initials}</div></div></div>`).join('')||`<div class="subtle" style="padding:12px">No items</div>`}</div>`}
+function kanbanColumn(status,tasks){return `<div class="kanban-col"><div class="kanban-head">${escapeHtml(status)}<span>${tasks.length}</span></div>${tasks.map(t=>`<div class="kanban-card" data-task="${escapeHtml(t.id)}"><strong>${escapeHtml(t.title)}</strong><div class="meta">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div><div class="foot">${priorityPill(t.priority)}<div class="mini-avatar">${escapeHtml(user(t.owner).initials)}</div></div></div>`).join('')||`<div class="subtle" style="padding:12px">No items</div>`}</div>`}
 
 function renderMyWork(){
   const u=state.currentUser; setTitle('My Work',user(u).name.toUpperCase());
@@ -311,37 +315,37 @@ function renderMyWork(){
     </div>
     ${groups.map(([name,list])=>`<div class="section-row"><div><h2>${name}</h2><p>${list.length} item${list.length===1?'':'s'}</p></div></div><div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Project</th><th>Priority</th><th>Status</th><th>Due</th><th>Next Action</th></tr></thead><tbody>${list.map(taskRow).join('')||`<tr><td colspan="6"><div class="empty"><strong>Nothing here</strong>No tasks in this section.</div></td></tr>`}</tbody></table></div></div>`).join('')}`;
 }
-function taskRow(t){return `<tr><td><button class="task-link" data-task="${t.id}">${t.title}</button><div class="subtle">${t.workstream} • ${t.deliverable}</div></td><td>${project(t.project).name}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${t.next}</td></tr>`}
+function taskRow(t){return `<tr><td><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><div class="subtle">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div></td><td>${escapeHtml(project(t.project)?.name||t.regularFolderName||'Regular Work')}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${escapeHtml(t.next)}</td></tr>`}
 
 function renderApprovals(){
   setTitle('Approvals','CONTROL DESK');
   const pending=state.currentUser==='u1'?state.approvals:state.approvals.filter(a=>a.requestedBy===state.currentUser);
   el('content').innerHTML=`
     <div class="section-row" style="margin-top:0"><div><h2>${state.currentUser==='u1'?'Pending decisions':'My requests'}</h2><p>Sensitive changes and final deliverables are never silently altered.</p></div></div>
-    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Type</th><th>Task</th><th>Requested By</th><th>Requested</th><th>Detail</th><th>Action</th></tr></thead><tbody>${pending.map(a=>{const t=task(a.task);return `<tr><td>${a.type}</td><td><button class="task-link" data-task="${t.id}">${t.title}</button><div class="subtle">${project(t.project).name}</div></td><td>${person(a.requestedBy)}</td><td>${fmtTime(a.requestedAt)}</td><td>${a.detail}</td><td>${state.currentUser==='u1'?`<button class="btn btn-soft approve-btn" data-approval="${a.id}">Approve</button> <button class="btn btn-ghost reject-btn" data-approval="${a.id}">Reject</button>`:'Pending'}</td></tr>`}).join('')||`<tr><td colspan="6"><div class="empty"><strong>All clear</strong>No pending approvals.</div></td></tr>`}</tbody></table></div></div>`;
+    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Type</th><th>Task</th><th>Requested By</th><th>Requested</th><th>Detail</th><th>Action</th></tr></thead><tbody>${pending.map(a=>{const t=task(a.task);return `<tr><td>${escapeHtml(a.type)}</td><td><button class="task-link" data-task="${escapeHtml(t?.id)}">${escapeHtml(t?.title)}</button><div class="subtle">${escapeHtml(project(t?.project)?.name||t?.regularFolderName||'Regular Work')}</div></td><td>${person(a.requestedBy)}</td><td>${fmtTime(a.requestedAt)}</td><td>${escapeHtml(a.detail)}</td><td>${state.currentUser==='u1'?`<button class="btn btn-soft approve-btn" data-approval="${escapeHtml(a.id)}">Approve</button> <button class="btn btn-ghost reject-btn" data-approval="${escapeHtml(a.id)}">Reject</button>`:'Pending'}</td></tr>`}).join('')||`<tr><td colspan="6"><div class="empty"><strong>All clear</strong>No pending approvals.</div></td></tr>`}</tbody></table></div></div>`;
 }
 
 function renderTeam(){
   setTitle('People','WORKLOAD & ACCOUNTABILITY');
-  el('content').innerHTML=`<div class="section-row" style="margin-top:0"><div><h2>${state.users.length} individual account${state.users.length===1?'':'s'}</h2><p>Every change is attributable to a real person.</p></div></div><div class="team-grid">${state.users.map(u=>{const ts=state.tasks.filter(t=>t.owner===u.id);return `<div class="team-card">${avatar(u.id)}<strong>${u.name}</strong><div class="role">${u.role} • ${u.dept}</div><div class="team-numbers"><div class="team-num"><b>${ts.filter(t=>t.status!=='Completed').length}</b><span>OPEN</span></div><div class="team-num"><b>${ts.filter(isOverdue).length}</b><span>OVERDUE</span></div><div class="team-num"><b>${ts.filter(t=>t.waitingOn).length}</b><span>WAITING</span></div></div></div>`}).join('')}</div>`;
+  el('content').innerHTML=`<div class="section-row" style="margin-top:0"><div><h2>${state.users.length} individual account${state.users.length===1?'':'s'}</h2><p>Every change is attributable to a real person.</p></div></div><div class="team-grid">${state.users.map(u=>{const ts=state.tasks.filter(t=>t.owner===u.id);return `<div class="team-card">${avatar(u.id)}<strong>${escapeHtml(u.name)}</strong><div class="role">${escapeHtml(u.role)} • ${escapeHtml(u.dept)}</div><div class="team-numbers"><div class="team-num"><b>${ts.filter(t=>t.status!=='Completed').length}</b><span>OPEN</span></div><div class="team-num"><b>${ts.filter(isOverdue).length}</b><span>OVERDUE</span></div><div class="team-num"><b>${ts.filter(t=>t.waitingOn).length}</b><span>WAITING</span></div></div></div>`}).join('')}</div>`;
 }
 
 function renderActivity(){
   setTitle('Activity','IMMUTABLE HISTORY');
   el('content').innerHTML=`
-    <div class="section-row" style="margin-top:0"><div><h2>Global audit trail</h2><p>Who changed what, when, and where.</p></div><div class="filters"><select class="select"><option>All People</option>${state.users.map(u=>`<option>${u.name}</option>`).join('')}</select><select class="select"><option>All Change Types</option><option>Deadline</option><option>Status</option><option>Progress</option><option>Review</option></select></div></div>
+    <div class="section-row" style="margin-top:0"><div><h2>Global audit trail</h2><p>Who changed what, when, and where.</p></div><div class="filters"><select class="select"><option>All People</option>${state.users.map(u=>`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`).join('')}</select><select class="select"><option>All Change Types</option><option>Deadline</option><option>Status</option><option>Progress</option><option>Review</option></select></div></div>
     <div class="panel"><div class="panel-body"><div class="activity">${state.activity.map(activityItem).join('')}</div></div></div>`;
 }
-function activityItem(a){const t=task(a.task),source=t?.contextType==='regular_work'?` • Regular Work · ${t.regularFolderName||'Folder'} · ${t.regularCategoryName||t.workstream||''}`:a.project?` • ${project(a.project).name}`:'';return `<div class="activity-item">${avatar(a.user)}<div class="activity-copy"><strong>${user(a.user).name}</strong><p>${a.text}${t?` on <button class="task-link" data-task="${t.id}">${t.title}</button>`:''}${source}</p>${a.change?`<div class="change">${a.change}</div>`:''}</div><div class="activity-time">${fmtTime(a.time)}</div></div>`}
+function activityItem(a){const t=task(a.task),source=t?.contextType==='regular_work'?` • Regular Work · ${t.regularFolderName||'Folder'} · ${t.regularCategoryName||t.workstream||''}`:a.project?` • ${project(a.project)?.name||''}`:'';return `<div class="activity-item">${avatar(a.user)}<div class="activity-copy"><strong>${escapeHtml(user(a.user).name)}</strong><p>${escapeHtml(a.text)}${t?` on <button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button>`:''}${escapeHtml(source)}</p>${a.change?`<div class="change">${escapeHtml(a.change)}</div>`:''}</div><div class="activity-time">${fmtTime(a.time)}</div></div>`}
 
 function openTask(id){
   const t=task(id); if(!t)return; const p=project(t.project); const comments=state.comments.filter(c=>c.task===id); const history=state.activity.filter(a=>a.task===id);
-  el('drawerEyebrow').textContent=`${p.name.toUpperCase()} • ${t.workstream.toUpperCase()}`; el('drawerTitle').textContent=t.title;
+  el('drawerEyebrow').textContent=`${(p?.name||t.regularFolderName||'Regular Work').toUpperCase()} • ${String(t.workstream||'').toUpperCase()}`; el('drawerTitle').textContent=t.title;
   el('drawerBody').innerHTML=`
-    <div class="drawer-section"><div class="drawer-actions">${priorityPill(t.priority)}${statusPill(isOverdue(t)?'Overdue':t.status)}${t.waitingOn?`<span class="status-pill waiting">Waiting on ${t.waitingOn.startsWith?.('u')?user(t.waitingOn).name:t.waitingOn}</span>`:''}</div></div>
-    <div class="drawer-section"><h4>Task details</h4><div class="detail-grid"><div class="detail-box"><span>Owner</span><strong>${user(t.owner).name}</strong></div><div class="detail-box"><span>Reviewer</span><strong>${user(t.reviewer).name}</strong></div><div class="detail-box"><span>Original Due</span><strong>${fmtDateFull(t.originalDue)}</strong></div><div class="detail-box"><span>Current Due</span><strong>${fmtDateFull(t.currentDue)}</strong></div><div class="detail-box"><span>Progress</span><strong>${t.progress}%</strong></div><div class="detail-box"><span>Next Action</span><strong>${t.next}</strong></div></div></div>
-    <div class="drawer-section"><h4>Update work</h4><div class="drawer-actions"><button class="btn btn-soft status-update" data-task="${id}" data-status="In Progress">Start / Resume</button><button class="btn btn-soft status-update" data-task="${id}" data-status="Ready for Review">Ready for Review</button><button class="btn btn-ghost deadline-request" data-task="${id}">Request Deadline Change</button></div></div>
-    <div class="drawer-section"><h4>Comments</h4><div class="comment-box"><textarea id="newComment" placeholder="Add an update, blocker, decision or @mention…"></textarea><button class="btn btn-soft" id="addComment" data-task="${id}">Post</button></div>${comments.map(c=>`<div class="comment">${avatar(c.user)}<div><strong>${user(c.user).name}</strong> <span>• ${fmtTime(c.time)}</span><p>${c.text}</p></div></div>`).join('')||`<div class="subtle" style="margin-top:12px">No comments yet.</div>`}</div>
+    <div class="drawer-section"><div class="drawer-actions">${priorityPill(t.priority)}${statusPill(isOverdue(t)?'Overdue':t.status)}${t.waitingOn?`<span class="status-pill waiting">Waiting on ${escapeHtml(t.waitingOn.startsWith?.('u')?user(t.waitingOn).name:t.waitingOn)}</span>`:''}</div></div>
+    <div class="drawer-section"><h4>Task details</h4><div class="detail-grid"><div class="detail-box"><span>Owner</span><strong>${escapeHtml(user(t.owner).name)}</strong></div><div class="detail-box"><span>Reviewer</span><strong>${escapeHtml(user(t.reviewer).name)}</strong></div><div class="detail-box"><span>Original Due</span><strong>${fmtDateFull(t.originalDue)}</strong></div><div class="detail-box"><span>Current Due</span><strong>${fmtDateFull(t.currentDue)}</strong></div><div class="detail-box"><span>Progress</span><strong>${Math.max(0,Math.min(100,Number(t.progress)||0))}%</strong></div><div class="detail-box"><span>Next Action</span><strong>${escapeHtml(t.next)}</strong></div></div></div>
+    <div class="drawer-section"><h4>Update work</h4><div class="drawer-actions"><button class="btn btn-soft status-update" data-task="${escapeHtml(id)}" data-status="In Progress">Start / Resume</button><button class="btn btn-soft status-update" data-task="${escapeHtml(id)}" data-status="Ready for Review">Ready for Review</button><button class="btn btn-ghost deadline-request" data-task="${escapeHtml(id)}">Request Deadline Change</button></div></div>
+    <div class="drawer-section"><h4>Comments</h4><div class="comment-box"><textarea id="newComment" placeholder="Add an update, blocker, decision or @mention…"></textarea><button class="btn btn-soft" id="addComment" data-task="${escapeHtml(id)}">Post</button></div>${comments.map(c=>`<div class="comment">${avatar(c.user)}<div><strong>${escapeHtml(user(c.user).name)}</strong> <span>• ${fmtTime(c.time)}</span><p>${escapeHtml(c.text)}</p></div></div>`).join('')||`<div class="subtle" style="margin-top:12px">No comments yet.</div>`}</div>
     <div class="drawer-section"><h4>Activity history</h4><div class="activity">${history.map(activityItem).join('')||`<div class="subtle">No recorded activity yet.</div>`}</div></div>`;
   el('taskDrawer').classList.add('open'); el('drawerBackdrop').classList.add('open'); wireDrawer(id);
 }

@@ -6,17 +6,21 @@ import {
   getAuth,
   inMemoryPersistence,
   onAuthStateChanged,
+  sendEmailVerification,
   sendPasswordResetEmail,
   setPersistence,
   signInWithEmailAndPassword,
   signOut
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import { get, getDatabase, onValue, ref, runTransaction, set, update } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js';
+import './scoped-workspace-migration.js';
 
-const SYSTEM_ADMIN_EMAIL = 'ashish@arpitatravels.com';
+const SYSTEM_ADMIN_EMAIL = 'ashish@enchantingmp.in';
+const TRUSTED_SYSTEM_ADMIN_UID = 'lGhNVO4kclh133CqgCiyPo3V5DA3';
 const AUTH_LOADING = 'AUTH_LOADING';
 const AUTHENTICATED = 'AUTHENTICATED';
 const SIGNED_OUT = 'SIGNED_OUT';
+const VERIFICATION_REQUIRED = 'VERIFICATION_REQUIRED';
 const firebaseConfig = {
   apiKey: 'AIzaSyC0gOy_JIaIpds2BdoHGv20EZiuHt8ozvM',
   authDomain: 'project-hub-emp.firebaseapp.com',
@@ -48,6 +52,7 @@ const privateDataPath = 'executionHub/admin/private';
 const migrationBackupsPath = 'executionHub/migrationBackups';
 const migrationMetadataPath = 'executionHub/system/migrations/sparkMigrationV1';
 const migrationId = 'sparkMigrationV1';
+const scopedDataVersion = 1;
 const regularWorkPath = 'executionHub/regularWork';
 const regularWorkOwnersPath = `${regularWorkPath}/owners`;
 const regularWorkTasksPath = `${regularWorkPath}/tasks`;
@@ -67,7 +72,6 @@ const employeeCreationApp = initializeApp(firebaseConfig, 'employeeCreation');
 const employeeCreationAuth = getAuth(employeeCreationApp);
 let authUser = null;
 let employeeProfile = null;
-let systemAdminUid = null;
 let stopWatching = null;
 let stopProfileWatch = null;
 let stopPrivateWatching = null;
@@ -130,7 +134,32 @@ function setFirebaseAuthState(nextState) {
 }
 
 function isSystemAdmin(user = auth.currentUser) {
-  return !!user?.uid && user.uid === systemAdminUid;
+  return !!user
+    && user.uid === TRUSTED_SYSTEM_ADMIN_UID
+    && user.emailVerified === true
+    && user.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase();
+}
+
+function logAuthIdentity(user) {
+  const uidMatches = user?.uid === TRUSTED_SYSTEM_ADMIN_UID;
+  const emailMatches = user?.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase();
+  const emailVerified = user?.emailVerified === true;
+  console.info('Firebase Auth identity', {
+    'AUTH UID': user?.uid || '',
+    'AUTH EMAIL': user?.email || '',
+    'EMAIL VERIFIED': emailVerified
+  });
+  console.info('System Admin identity comparison', {
+    'UID MATCH': uidMatches ? 'YES' : 'NO',
+    'EMAIL MATCH': emailMatches ? 'YES' : 'NO',
+    'EMAIL VERIFIED': emailVerified ? 'YES' : 'NO',
+    'isSystemAdmin()': isSystemAdmin(user) ? 'YES' : 'NO'
+  });
+}
+
+function isWorkspaceReady(marker) {
+  return window.ScopedWorkspaceMigration?.isWorkspaceReady(marker)
+    && marker.scopedDataVersion === scopedDataVersion;
 }
 
 function emptyState() {
@@ -399,7 +428,8 @@ async function readWorkspace() {
     || JSON.stringify(adminManagement) !== JSON.stringify(storedManagement)
     || JSON.stringify(directory) !== JSON.stringify(storedDirectory)
     || JSON.stringify(adminPrivateData) !== JSON.stringify(storedPrivate);
-  recoveryPending = hasData(legacy) && (missingLegacyData || marker?.status !== 'completed');
+  recoveryPending = !isWorkspaceReady(marker)
+    || (hasData(legacy) && (missingLegacyData || marker?.status !== 'completed'));
   recoveryContext = { legacy, target, storedDirectory, storedManagement, storedPrivate, profiles: rawProfiles, marker };
 
   const state = normalizeWorkspace({
@@ -507,6 +537,12 @@ async function readRegularWorkData(firebaseUid, admin, employeeProfile = null) {
   const approvalsByTask=recordsFrom(data.approvals).reduce((map,approval)=>{(map[approval.task]||(map[approval.task]=[])).push(approval);return map},{});
   const eventsByTask=recordsFrom(data.calendarEvents).reduce((map,event)=>{const taskId=event.regularWorkTaskId||event.task;if(taskId)(map[taskId]||(map[taskId]=[])).push(event);return map},{});
   data.access=Object.fromEntries(tasks.map(task=>[task.id,[...new Set([task.folderOwnerUserId,task.createdBy,task.owner,...(approvalsByTask[task.id]||[]).flatMap(approval=>[approval.requestedBy,...(approval.approvers||[])]),...(eventsByTask[task.id]||[]).flatMap(event=>[event.createdBy,...(event.participants||[])])].filter(Boolean))]]));
+  tasks.forEach(task=>{
+    const taskAccessUsers=admin
+      ? Object.entries(stored.taskAccess||{}).filter(([,taskIds])=>taskIds?.[task.id]===true).map(([appUserId])=>appUserId)
+      : allowedTaskIds.includes(task.id)&&employeeProfile?.appUserId?[employeeProfile.appUserId]:[];
+    data.access[task.id]=[...new Set([...(data.access[task.id]||[]),...taskAccessUsers])];
+  });
   data.tasks.forEach(task=>{task.accessUserIds=data.access[task.id]||[]});
   lastRegularWorkSnapshot = cloneRegularWorkSnapshot(data);
   return data;
@@ -751,10 +787,14 @@ async function runSparkMigration() {
   let backupPath = '';
   try {
     const context = recoveryContext;
-    const backupsSnapshot = await get(ref(database, migrationBackupsPath));
-    const backups = backupsSnapshot.exists() ? backupsSnapshot.val() : {};
-    let backupEntry = Object.entries(backups).find(([, value]) => value?.migrationId === migrationId);
-    if (!backupEntry) {
+    const existingBackupPath = String(context.marker?.backupPath || '');
+    let existingBackup = null;
+    if (existingBackupPath.startsWith(`${migrationBackupsPath}/`)) {
+      const snapshot = await get(ref(database, existingBackupPath));
+      if (snapshot.val()?.migrationId === migrationId) existingBackup = snapshot.val();
+    }
+    if (existingBackup) backupPath = existingBackupPath;
+    else {
       const backupKey = String(Date.now());
       backupPath = `${migrationBackupsPath}/${backupKey}`;
       const backup = {
@@ -771,9 +811,7 @@ async function runSparkMigration() {
         employeeProfiles: cloneWithoutCredentials(context.profiles)
       };
       await set(ref(database, backupPath), backup);
-      backupEntry = [backupKey, backup];
     }
-    if (!backupPath) backupPath = `${migrationBackupsPath}/${backupEntry[0]}`;
 
     await set(ref(database, migrationMetadataPath), {
       migrationId,
@@ -790,20 +828,55 @@ async function runSparkMigration() {
     const directory = safeDirectory(mergeData(management, context.storedDirectory));
     const privateSource = presentPrivateCollections(source);
     const privateData = mergeData(context.storedPrivate, mergeData(adminPrivateData, privateSource));
+    const scopedState = { ...operational, users: recordsFrom(management.users), departments: recordsFrom(management.departments) };
+    const scopedPlan = window.ScopedWorkspaceMigration?.buildScopedWorkspaceMigration(scopedState);
+    if (!scopedPlan?.ready) {
+      throw new Error(`Scoped employee data migration validation failed: ${(scopedPlan?.blockers || ['migration planner unavailable']).join('; ')}`);
+    }
+    const scopedEntries = Object.entries(scopedPlan.updates);
+    const targetSnapshots = await Promise.all(scopedEntries.map(([path]) => get(ref(database, path))));
+    const scopedUpdates = {};
+    const scopedTargetBefore = [];
+    scopedEntries.forEach(([path, planned], index) => {
+      const snapshot = targetSnapshots[index];
+      const existing = snapshot.exists() ? snapshot.val() : null;
+      scopedTargetBefore.push({ path, value: existing });
+      scopedUpdates[path] = existing ? mergeData(existing, planned) : planned;
+    });
+    const scopedBackupPath = `${migrationBackupsPath}/scoped-${migrationId}`;
+    const scopedBackupSnapshot = await get(ref(database, scopedBackupPath));
+    if (!scopedBackupSnapshot.exists()) {
+      await set(ref(database, scopedBackupPath), {
+        migrationId: 'scopedWorkspaceV1',
+        createdAt: new Date().toISOString(),
+        sourcePath: workspacePath,
+        targetSnapshot: scopedTargetBefore,
+        plannedCounts: scopedPlan.counts,
+        retainedLegacyActivity: scopedPlan.counts.retainedLegacyActivity
+      });
+    }
     const updates = {
       [workspacePath]: operational,
       [employeeDirectoryPath]: directory,
-      [adminManagementPath]: management
+      [adminManagementPath]: management,
+      ...scopedUpdates
     };
     if (Object.keys(privateData).length) updates[privateDataPath] = privateData;
     await update(ref(database), updates);
+    const scopedReadBack = await Promise.all(scopedEntries.map(([path]) => get(ref(database, path))));
+    const missingScopedTargets = scopedReadBack.flatMap((snapshot, index) => snapshot.exists() ? [] : [scopedEntries[index][0]]);
+    if (missingScopedTargets.length) throw new Error(`Scoped employee data verification failed for ${missingScopedTargets.join(', ')}`);
     await set(ref(database, migrationMetadataPath), {
       migrationId,
       status: 'completed',
       completedAt: new Date().toISOString(),
       sourcePath: legacyWorkspacePath,
       targetPath: workspacePath,
-      backupPath
+      backupPath,
+      scopedDataVersion,
+      scopedMigrationAt: new Date().toISOString(),
+      scopedBackupPath,
+      scopedCounts: scopedPlan.counts
     });
 
     recoveryPending = false;
@@ -828,9 +901,10 @@ async function runSparkMigration() {
 
 async function authorize(user) {
   if (!user?.email) throw new Error('Your Firebase account does not have an email address.');
-  systemAdminUid = null;
-  if (user.email.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()) {
-    systemAdminUid = user.uid;
+  if (user.uid === TRUSTED_SYSTEM_ADMIN_UID
+    && user.email.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase()
+    && user.emailVerified !== true) {
+    throw Object.assign(new Error('Verify the System Admin email before continuing.'), { code: 'app/admin-verification-required' });
   }
   const admin = isSystemAdmin(user);
   if (admin) {
@@ -840,21 +914,27 @@ async function authorize(user) {
   if (!admin) {
     const snapshot = await get(ref(database, `${employeeProfilesPath}/${user.uid}`));
     profile = snapshot.exists() ? snapshot.val() : null;
-    if (!profile || profile.uid !== user.uid || profile.email?.toLowerCase() !== user.email.toLowerCase() || profile.role !== 'employee') {
-      throw Object.assign(new Error('Your account exists but is not authorized for this application. Please contact the administrator.'), { code: 'app/not-authorized' });
-    }
-    if (profile.status !== 'active') {
-      const messages = {
-        inactive: 'Your account is inactive. Please contact the administrator.',
-        resigned: 'Your account is marked as resigned. Please contact the administrator.',
-        suspended: 'Your account is suspended. Please contact the administrator.',
-        exited: 'Your account is marked as exited. Please contact the administrator.'
-      };
-      throw Object.assign(new Error(messages[profile.status] || 'Your account is disabled. Please contact the administrator.'), { code: 'app/account-disabled' });
-    }
-    if (typeof profile.appUserId !== 'string' || !profile.appUserId.trim()) throw Object.assign(new Error('Your employee profile is incomplete. Please contact the administrator.'), { code: 'app/not-authorized' });
+    console.info('Employee authorization profile mapping', {
+      path: `${employeeProfilesPath}/${user.uid}`,
+      profileFound: snapshot.exists(),
+      profileUidMatches: profile?.uid === user.uid,
+      profileEmailMatches: profile?.email?.toLowerCase() === user.email.toLowerCase(),
+      role: profile?.role || '',
+      appUserId: profile?.appUserId || '',
+      status: profile?.status || ''
+    });
+    const profileDecision = window.ScopedWorkspaceMigration.validateEmployeeProfile(user, profile);
+    if (!profileDecision.allowed) throw Object.assign(new Error(profileDecision.message), { code: profileDecision.code });
     const migrationSnapshot = await get(ref(database, migrationMetadataPath));
-    if (migrationSnapshot.val()?.status !== 'completed') {
+    const marker = migrationSnapshot.val();
+    const workspaceReady = isWorkspaceReady(marker);
+    console.info('Employee workspace recovery readiness', {
+      markerFound: migrationSnapshot.exists(),
+      status: marker?.status || '',
+      scopedDataVersion: marker?.scopedDataVersion ?? null,
+      ready: workspaceReady
+    });
+    if (!workspaceReady) {
       throw Object.assign(new Error('The administrator must complete workspace data recovery before employee access is enabled.'), { code: 'app/migration-pending' });
     }
   }
@@ -915,15 +995,97 @@ function setApplicationVisible(visible) {
 
 function friendlyAuthError(error) {
   const code = error?.code || '';
-  if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') return 'Email or password is incorrect.';
+  if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential' || code === 'auth/invalid-login-credentials') return 'Email or password is incorrect.';
   if (code === 'auth/too-many-requests') return 'Too many sign-in attempts. Wait a while and try again.';
   if (code === 'auth/network-request-failed') return 'Network error. Check your connection and try again.';
   if (code === 'auth/user-disabled') return 'This Firebase account is disabled. Please contact the administrator.';
   if (code === 'auth/email-already-in-use') return 'An account already exists for this email.';
-  if (code === 'auth/weak-password') return 'The temporary password must contain at least 6 characters.';
+  if (code === 'auth/weak-password') return 'The temporary password must contain at least 14 characters.';
   if (code === 'auth/operation-not-allowed') return 'Email and password sign-in is not enabled in Firebase Console.';
   if (code === 'PERMISSION_DENIED' || error?.message?.includes('PERMISSION_DENIED')) return 'Firebase denied access. Check the deployed Realtime Database rules.';
-  return error?.message || 'Unable to complete the Firebase request. Please try again.';
+  return 'Unable to complete the Firebase request. Please try again.';
+}
+
+function friendlyLoginError(error) {
+  if (error?.code === 'auth/too-many-requests' || error?.code === 'auth/network-request-failed') return friendlyAuthError(error);
+  return 'Email or password is incorrect.';
+}
+
+function showAdminEmailVerification(user) {
+  setApplicationVisible(false);
+  let overlay = document.getElementById('firebaseAuthOverlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'firebaseAuthOverlay';
+    overlay.className = 'login-overlay open';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = '<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">SYSTEM ADMIN VERIFICATION</div><h1>Verify your email.</h1><p>Verify the System Admin email address before signing in.</p><div id="adminVerificationMessage" class="login-error" role="status"></div><button class="btn btn-primary login-btn" id="resendAdminVerification" type="button">Resend verification email</button><button class="link-btn" id="confirmAdminVerification" type="button">I have verified — refresh and sign in again</button><button class="link-btn" id="switchAdminVerificationAccount" type="button">Use a different account</button></div>';
+  overlay.classList.add('open');
+
+  const message = document.getElementById('adminVerificationMessage');
+  const resendButton = document.getElementById('resendAdminVerification');
+  const confirmButton = document.getElementById('confirmAdminVerification');
+  const switchButton = document.getElementById('switchAdminVerificationAccount');
+  resendButton.onclick = async () => {
+    const currentUser = auth.currentUser;
+    if (!currentUser || currentUser.uid !== user.uid
+      || currentUser.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase()) {
+      message.textContent = 'Your sign-in session changed. Please sign in again.';
+      return;
+    }
+    resendButton.disabled = true;
+    try {
+      await sendEmailVerification(currentUser);
+      message.textContent = 'Verification email sent. Open the email, verify your account, then sign in again.';
+    } catch (error) {
+      const code = error?.code || 'auth/unknown';
+      console.error('Firebase verification email request failed:', { code, message: error?.message || '' });
+      if (code === 'auth/too-many-requests') {
+        message.textContent = 'Firebase is temporarily limiting verification emails. Wait a while, then try again.';
+      } else if (code === 'auth/operation-not-allowed') {
+        message.textContent = 'Firebase rejected verification email sending. Check the project Authentication email settings.';
+      } else if (code === 'auth/user-disabled') {
+        message.textContent = 'This Firebase Auth account is disabled. Contact the administrator.';
+      } else if (code === 'auth/network-request-failed') {
+        message.textContent = 'Network error while sending verification email. Check your connection and try again.';
+      } else {
+        message.textContent = `Could not send the verification email (${code}). Check the browser console for Firebase details.`;
+      }
+    } finally {
+      resendButton.disabled = false;
+    }
+  };
+  confirmButton.onclick = async () => {
+    confirmButton.disabled = true;
+    try {
+      const currentUser = auth.currentUser;
+      if (!currentUser || currentUser.uid !== user.uid) {
+        message.textContent = 'Your sign-in session changed. Please sign in again.';
+        return;
+      }
+      await currentUser.reload();
+      const refreshedUser = auth.currentUser || currentUser;
+      const tokenResult = await refreshedUser.getIdTokenResult(true);
+      const tokenEmailVerified = tokenResult.claims.email_verified === true;
+      logAuthIdentity(refreshedUser);
+      console.info('Refreshed Firebase Auth token email_verified:', tokenEmailVerified);
+      if (refreshedUser.emailVerified !== true || !tokenEmailVerified) {
+        message.textContent = 'Email verification is not confirmed yet. Open the verification email, then try again.';
+        return;
+      }
+      pendingAuthMessage = 'Email verified. Please sign in again.';
+      await signOut(auth);
+    } catch {
+      message.textContent = 'Could not refresh the verification status. Please try again.';
+    } finally {
+      confirmButton.disabled = false;
+    }
+  };
+  switchButton.onclick = async () => {
+    pendingAuthMessage = '';
+    await signOut(auth).catch(() => {});
+  };
 }
 
 function showLogin(message = '') {
@@ -935,7 +1097,8 @@ function showLogin(message = '') {
     overlay.className = 'login-overlay open';
     document.body.appendChild(overlay);
   }
-  overlay.innerHTML = `<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Welcome back.</h1><p>Sign in with your authorized company account.</p><form id="firebaseLoginForm" class="form-stack"><label class="form-field"><span>Email</span><input class="input" name="email" type="email" autocomplete="username" required placeholder="name@company.com"></label><label class="form-field"><span>Password</span><input class="input" name="password" type="password" autocomplete="current-password" required placeholder="••••••••"></label><div id="firebaseAuthMessage" class="login-error">${message}</div><button class="btn btn-primary login-btn" type="submit">Login</button><button class="link-btn" id="firebaseForgotPassword" type="button">Forgot Password</button></form></div>`;
+  overlay.innerHTML = `<div class="login-card"><div class="login-brand"><div class="brand-mark">EH</div><div><strong>Execution Hub</strong><span>Projects • Launches • Accountability</span></div></div><div class="eyebrow">PRIVATE TEAM ACCESS</div><h1>Welcome back.</h1><p>Sign in with your authorized company account.</p><form id="firebaseLoginForm" class="form-stack"><label class="form-field"><span>Email</span><input class="input" name="email" type="email" autocomplete="username" required placeholder="name@company.com"></label><label class="form-field"><span>Password</span><input class="input" name="password" type="password" autocomplete="current-password" required placeholder="••••••••"></label><div id="firebaseAuthMessage" class="login-error"></div><button class="btn btn-primary login-btn" type="submit">Login</button><button class="link-btn" id="firebaseForgotPassword" type="button">Forgot Password</button></form></div>`;
+  document.getElementById('firebaseAuthMessage').textContent = message;
   overlay.classList.add('open');
   const form = document.getElementById('firebaseLoginForm');
   form.onsubmit = async event => {
@@ -945,9 +1108,10 @@ function showLogin(message = '') {
     button.disabled = true;
     document.getElementById('firebaseAuthMessage').textContent = '';
     try {
-      await signInWithEmailAndPassword(auth, String(values.get('email')).trim(), String(values.get('password')));
+      const credential = await signInWithEmailAndPassword(auth, String(values.get('email')).trim(), String(values.get('password')));
+      logAuthIdentity(credential.user);
     } catch (error) {
-      document.getElementById('firebaseAuthMessage').textContent = friendlyAuthError(error);
+      document.getElementById('firebaseAuthMessage').textContent = friendlyLoginError(error);
       button.disabled = false;
     }
   };
@@ -959,7 +1123,9 @@ function showLogin(message = '') {
       await sendPasswordResetEmail(auth, email);
       messageEl.textContent = 'If an account exists for this email, a password reset link has been sent.';
     } catch (error) {
-      messageEl.textContent = friendlyAuthError(error);
+      messageEl.textContent = error?.code === 'auth/network-request-failed'
+        ? 'Network error. Check your connection and try again.'
+        : 'If an account exists for this email, a password reset link has been sent.';
     }
   };
 }
@@ -978,13 +1144,16 @@ async function loadClassicScript(src) {
 async function loadApplication() {
   if (appLoaded) return;
   await loadClassicScript('view-routing.js');
+  await loadClassicScript('xss-safety.js');
   await loadClassicScript('app.js');
   await loadClassicScript('regular-work-comment-guard.js');
+  await loadClassicScript('regular-work-task-status.js');
   await loadClassicScript('phase13.js');
   await loadClassicScript('phase15.js');
   await loadClassicScript('phase19.js');
   await loadClassicScript('phase17.js');
   await loadClassicScript('phase18.js');
+  await loadClassicScript('daily-work-model.js');
   await loadClassicScript('phase20.js');
   appLoaded = true;
   window.executionHubModulesReady = true;
@@ -994,7 +1163,6 @@ async function handleAuthState(user) {
   if (!user) {
     authUser = null;
     employeeProfile = null;
-    systemAdminUid = null;
     handlingUid = null;
     if (stopWatching) stopWatching();
     stopWatching = null;
@@ -1019,6 +1187,11 @@ async function handleAuthState(user) {
   authFlow = (async () => {
     try {
       setFirebaseAuthState(AUTH_LOADING);
+      await user.reload();
+      user = auth.currentUser || user;
+      const tokenResult = await user.getIdTokenResult(true);
+      console.info('Refreshed Firebase Auth token email_verified:', tokenResult.claims.email_verified === true);
+      logAuthIdentity(user);
       const restored = await authorize(user);
       authUser = user;
       employeeProfile = restored?.profile || employeeProfile;
@@ -1033,10 +1206,18 @@ async function handleAuthState(user) {
       firebaseAuthState = AUTHENTICATED;
     } catch (error) {
       console.error('Firebase authorization failed:', error);
-      const message = error?.message || friendlyAuthError(error);
+      if (error?.code === 'app/admin-verification-required') {
+        authUser = null;
+        employeeProfile = null;
+        handlingUid = null;
+        firebaseAuthState = VERIFICATION_REQUIRED;
+        pendingAuthMessage = '';
+        showAdminEmailVerification(user);
+        return { error: error.message };
+      }
+      const message = friendlyAuthError(error);
       authUser = null;
       employeeProfile = null;
-      systemAdminUid = null;
       handlingUid = null;
       pendingAuthMessage = message;
       await signOut(auth).catch(() => {});
@@ -1349,7 +1530,15 @@ window.firebaseHub = {
   },
   async saveRegularWorkDailyTask(parentTaskId, dailyTask) {
     if (!dailyTask?.id || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId))) throw new Error('You do not have access to save a Daily Task here.');
-    await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
+    try {
+      await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
+    } catch (error) {
+      const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
+      if (permissionDenied) {
+        throw new Error('Firebase denied this Daily Task write. The deployed Realtime Database rules may be out of date; deploy the rules from database.rules.json and retry.');
+      }
+      throw error;
+    }
   },
   async saveRegularWorkComment(comment, activity) {
     const actorUid = auth.currentUser?.uid;
@@ -1407,20 +1596,20 @@ window.firebaseHub = {
       throw error;
     }
   },
-  watchRegularWorkDailyTasks(parentTaskIds, callback) {
+  watchRegularWorkDailyTasks(parentTaskIds, callback, onError = () => {}) {
     if (typeof callback !== 'function') return () => {};
     const ids = [...new Set(parentTaskIds || [])];
     if (isSystemAdmin()) {
       return onValue(ref(database, regularWorkDailyTasksPath), snapshot => {
         const all = snapshot.exists() ? snapshot.val() : {};
         ids.forEach(parentTaskId => callback(parentTaskId, recordsWithKeys(all?.[parentTaskId] || {})));
-      }, error => console.error('Could not monitor Daily Tasks:', error));
+      }, error => { onError(null, error); console.error('Could not monitor Daily Tasks:', error); });
     }
     const stops = ids
       .filter(parentTaskId => isSystemAdmin() || window.firebaseHub.canAccessRegularWorkTask(parentTaskId))
       .map(parentTaskId => onValue(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}`), snapshot => {
         callback(parentTaskId, snapshot.exists() ? recordsWithKeys(snapshot.val()) : []);
-      }, error => console.error(`Could not monitor Daily Tasks for ${parentTaskId}:`, error)));
+      }, error => { onError(parentTaskId, error); console.error(`Could not monitor Daily Tasks for ${parentTaskId}:`, error); }));
     return () => stops.forEach(stop => stop());
   },
   friendlyError: friendlyAuthError,
@@ -1587,6 +1776,7 @@ window.firebaseHub = {
   },
   AUTH_LOADING,
   AUTHENTICATED,
+  VERIFICATION_REQUIRED,
   SIGNED_OUT
 };
 

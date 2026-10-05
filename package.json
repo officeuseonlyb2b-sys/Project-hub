@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "test:security": "node security-emulator.test.mjs",
+    "test:security-config": "node --test security-config.test.mjs"
+  },
   "dependencies": {
     "firebase": "^12.19.0"
   }
