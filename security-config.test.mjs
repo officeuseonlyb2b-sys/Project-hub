@@ -8,6 +8,7 @@ const rules = JSON.parse(fs.readFileSync(new URL('./database.rules.json', import
 const hosting = JSON.parse(fs.readFileSync(new URL('./firebase.json', import.meta.url), 'utf8')).hosting;
 const authSource = fs.readFileSync(new URL('./firebase-bootstrap.js', import.meta.url), 'utf8');
 const phase13Source = fs.readFileSync(new URL('./phase13.js', import.meta.url), 'utf8');
+const phase19Source = fs.readFileSync(new URL('./phase19.js', import.meta.url), 'utf8');
 const employeeFormSource = fs.readFileSync(new URL('./phase18.js', import.meta.url), 'utf8');
 const appSource = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const { escapeHtml } = require('./xss-safety.js');
@@ -127,6 +128,8 @@ test('My Work heading has a semantic fallback for a null user name', () => {
   assert.equal((phase13Source.match(/userName=String\(user\((?:u|currentUser)\)\?\.name\|\|''\)\.trim\(\)\|\|'Team Member'/g) || []).length, 2);
   assert.equal(phase13Source.includes('user(currentUser).name.toUpperCase()'), false);
   assert.equal(phase13Source.includes('user(u).name.toUpperCase()'), false);
+  assert.ok(phase19Source.includes("String(user(state.currentUser)?.name||'').trim()||'Team Member'"));
+  assert.equal(phase19Source.includes('user(state.currentUser).name.toUpperCase()'), false);
 });
 
 test('all three activity paths require an absent old record, even for Admin', () => {

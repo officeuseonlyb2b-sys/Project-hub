@@ -180,7 +180,8 @@
   const baseRenderMyWork=renderMyWork;
   renderMyWork=function(){
     if(workFilter==='regular'){
-      setTitle('My Work',user(state.currentUser).name.toUpperCase());
+      const userName=String(user(state.currentUser)?.name||'').trim()||'Team Member';
+      setTitle('My Work',userName.toUpperCase());
       const content=el('content');content.innerHTML=`<div id="regularWorkArea">${renderRegularWorkArea()}</div>`;bindRegularWork();return;
     }
     baseRenderMyWork();
