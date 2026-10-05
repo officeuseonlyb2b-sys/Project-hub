@@ -173,7 +173,9 @@ function cleanState(value) {
   const result = JSON.parse(JSON.stringify(value || emptyState()));
   delete result.currentUser;
   privateCollections.forEach(collection => delete result[collection]);
-  result.users = (result.users || []).filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase());
+  result.users = (result.users || []).filter(account => String(account.id || '') !== 'u1'
+    && String(account.appUserId || '') !== 'u1'
+    && account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase());
   result.users.forEach(account => {
     delete account.passwordHash;
     delete account.password;
@@ -201,7 +203,9 @@ function cleanWorkspaceState(value) {
 
 function safeDirectory(state) {
   const users = recordsFrom(state?.users)
-    .filter(account => account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase())
+    .filter(account => String(account.id || '') !== 'u1'
+      && String(account.appUserId || '') !== 'u1'
+      && account.email?.toLowerCase() !== SYSTEM_ADMIN_EMAIL.toLowerCase())
     .map(account => {
       const safe = { ...account };
       ['mobile', 'phone', 'reportingTo', 'dateJoined', 'joiningDate', 'departmentHistory', 'createdBy', 'temporaryPassword', 'initialPassword', 'password', 'passwordHash', 'authUid', 'firebaseUid', 'uid'].forEach(key => delete safe[key]);
@@ -785,11 +789,22 @@ async function runSparkMigration() {
   if (!isSystemAdmin() || !recoveryPending || !recoveryContext || migrationInProgress) return;
   migrationInProgress = true;
   let backupPath = '';
+  let migrationStep = 'resume-existing-migration';
+  let migrationPath = migrationMetadataPath;
+  const stableJson = value => {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  };
   try {
     const context = recoveryContext;
     const existingBackupPath = String(context.marker?.backupPath || '');
     let existingBackup = null;
     if (existingBackupPath.startsWith(`${migrationBackupsPath}/`)) {
+      migrationStep = 'read-existing-migration-backup';
+      migrationPath = existingBackupPath;
       const snapshot = await get(ref(database, existingBackupPath));
       if (snapshot.val()?.migrationId === migrationId) existingBackup = snapshot.val();
     }
@@ -810,9 +825,13 @@ async function runSparkMigration() {
         privateData: cloneWithoutCredentials(context.storedPrivate),
         employeeProfiles: cloneWithoutCredentials(context.profiles)
       };
+      migrationStep = 'write-migration-backup';
+      migrationPath = backupPath;
       await set(ref(database, backupPath), backup);
     }
 
+    migrationStep = 'mark-migration-running';
+    migrationPath = migrationMetadataPath;
     await set(ref(database, migrationMetadataPath), {
       migrationId,
       status: 'running',
@@ -830,22 +849,44 @@ async function runSparkMigration() {
     const privateData = mergeData(context.storedPrivate, mergeData(adminPrivateData, privateSource));
     const scopedState = { ...operational, users: recordsFrom(management.users), departments: recordsFrom(management.departments) };
     const scopedPlan = window.ScopedWorkspaceMigration?.buildScopedWorkspaceMigration(scopedState);
+    migrationStep = 'validate-scoped-migration-plan';
+    migrationPath = 'executionHub/scopedWorkspaceMigrationPlan';
     if (!scopedPlan?.ready) {
       throw new Error(`Scoped employee data migration validation failed: ${(scopedPlan?.blockers || ['migration planner unavailable']).join('; ')}`);
     }
     const scopedEntries = Object.entries(scopedPlan.updates);
-    const targetSnapshots = await Promise.all(scopedEntries.map(([path]) => get(ref(database, path))));
+    const targetSnapshots = [];
+    for (const [path] of scopedEntries) {
+      migrationStep = 'read-scoped-target-before-write';
+      migrationPath = path;
+      targetSnapshots.push(await get(ref(database, path)));
+    }
     const scopedUpdates = {};
+    const scopedExpected = {};
     const scopedTargetBefore = [];
     scopedEntries.forEach(([path, planned], index) => {
       const snapshot = targetSnapshots[index];
       const existing = snapshot.exists() ? snapshot.val() : null;
       scopedTargetBefore.push({ path, value: existing });
-      scopedUpdates[path] = existing ? mergeData(existing, planned) : planned;
+      const merged = path === safeEmployeeDirectoryPath
+        ? planned
+        : existing ? mergeData(existing, planned) : planned;
+      scopedExpected[path] = merged;
+      if (existing && path.startsWith(`${sharedActivityPath}/`) && stableJson(existing) !== stableJson(planned)) {
+        migrationStep = 'validate-immutable-activity';
+        migrationPath = path;
+        throw new Error(`Immutable existing activity differs from the migration plan at ${path}; refusing to rewrite history.`);
+      }
+      if (existing && stableJson(existing) === stableJson(merged)) return;
+      scopedUpdates[path] = merged;
     });
     const scopedBackupPath = `${migrationBackupsPath}/scoped-${migrationId}`;
+    migrationStep = 'read-scoped-rollback-backup';
+    migrationPath = scopedBackupPath;
     const scopedBackupSnapshot = await get(ref(database, scopedBackupPath));
     if (!scopedBackupSnapshot.exists()) {
+      migrationStep = 'write-scoped-rollback-backup';
+      migrationPath = scopedBackupPath;
       await set(ref(database, scopedBackupPath), {
         migrationId: 'scopedWorkspaceV1',
         createdAt: new Date().toISOString(),
@@ -855,17 +896,29 @@ async function runSparkMigration() {
         retainedLegacyActivity: scopedPlan.counts.retainedLegacyActivity
       });
     }
-    const updates = {
-      [workspacePath]: operational,
-      [employeeDirectoryPath]: directory,
-      [adminManagementPath]: management,
-      ...scopedUpdates
-    };
-    if (Object.keys(privateData).length) updates[privateDataPath] = privateData;
-    await update(ref(database), updates);
-    const scopedReadBack = await Promise.all(scopedEntries.map(([path]) => get(ref(database, path))));
-    const missingScopedTargets = scopedReadBack.flatMap((snapshot, index) => snapshot.exists() ? [] : [scopedEntries[index][0]]);
-    if (missingScopedTargets.length) throw new Error(`Scoped employee data verification failed for ${missingScopedTargets.join(', ')}`);
+    const updates = { ...scopedUpdates };
+    if (stableJson(context.target) !== stableJson(operational)) updates[workspacePath] = operational;
+    if (stableJson(context.storedDirectory) !== stableJson(directory)) updates[employeeDirectoryPath] = directory;
+    if (stableJson(context.storedManagement) !== stableJson(management)) updates[adminManagementPath] = management;
+    if (Object.keys(privateData).length && stableJson(context.storedPrivate) !== stableJson(privateData)) updates[privateDataPath] = privateData;
+    for (const [path, value] of Object.entries(updates)) {
+      migrationStep = 'write-idempotent-recovery-target';
+      migrationPath = path;
+      await set(ref(database, path), value);
+    }
+    const readBackTargets = new Map([...scopedEntries.map(([path]) => path), ...Object.keys(updates)].map(path => [path, true]));
+    for (const path of readBackTargets.keys()) {
+      migrationStep = 'read-back-verify-recovery-target';
+      migrationPath = path;
+      const snapshot = await get(ref(database, path));
+      const expected = scopedExpected[path] ?? updates[path];
+      if (!snapshot.exists()) throw new Error(`Recovery read-back found no data at ${path}.`);
+      if (stableJson(snapshot.val()) !== stableJson(expected)) {
+        throw new Error(`Recovery read-back did not match the expected value at ${path}.`);
+      }
+    }
+    migrationStep = 'finalize-migration-marker';
+    migrationPath = migrationMetadataPath;
     await set(ref(database, migrationMetadataPath), {
       migrationId,
       status: 'completed',
@@ -892,8 +945,16 @@ async function runSparkMigration() {
       await window.firebaseHub.saveState(window.getFirebaseApplicationState());
     }
   } catch (error) {
-    console.error('Legacy data recovery did not complete; the original legacy data and backup were left untouched:', error);
-    window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
+    const recoveryError = {
+      functionName: 'runSparkMigration',
+      migrationStep,
+      path: migrationPath,
+      operation: migrationStep.startsWith('read') ? 'read' : migrationStep.startsWith('write') || migrationStep.startsWith('mark') || migrationStep.startsWith('finalize') ? 'write' : 'validate',
+      code: error?.code || 'migration/validation-failed',
+      message: error?.message || String(error)
+    };
+    console.error('Workspace recovery could not continue:', recoveryError);
+    window.dispatchEvent(new CustomEvent('firebase-recovery-error', { detail: recoveryError }));
   } finally {
     migrationInProgress = false;
   }
@@ -925,18 +986,6 @@ async function authorize(user) {
     });
     const profileDecision = window.ScopedWorkspaceMigration.validateEmployeeProfile(user, profile);
     if (!profileDecision.allowed) throw Object.assign(new Error(profileDecision.message), { code: profileDecision.code });
-    const migrationSnapshot = await get(ref(database, migrationMetadataPath));
-    const marker = migrationSnapshot.val();
-    const workspaceReady = isWorkspaceReady(marker);
-    console.info('Employee workspace recovery readiness', {
-      markerFound: migrationSnapshot.exists(),
-      status: marker?.status || '',
-      scopedDataVersion: marker?.scopedDataVersion ?? null,
-      ready: workspaceReady
-    });
-    if (!workspaceReady) {
-      throw Object.assign(new Error('The administrator must complete workspace data recovery before employee access is enabled.'), { code: 'app/migration-pending' });
-    }
   }
 
   let state;
@@ -1041,17 +1090,7 @@ function showAdminEmailVerification(user) {
     } catch (error) {
       const code = error?.code || 'auth/unknown';
       console.error('Firebase verification email request failed:', { code, message: error?.message || '' });
-      if (code === 'auth/too-many-requests') {
-        message.textContent = 'Firebase is temporarily limiting verification emails. Wait a while, then try again.';
-      } else if (code === 'auth/operation-not-allowed') {
-        message.textContent = 'Firebase rejected verification email sending. Check the project Authentication email settings.';
-      } else if (code === 'auth/user-disabled') {
-        message.textContent = 'This Firebase Auth account is disabled. Contact the administrator.';
-      } else if (code === 'auth/network-request-failed') {
-        message.textContent = 'Network error while sending verification email. Check your connection and try again.';
-      } else {
-        message.textContent = `Could not send the verification email (${code}). Check the browser console for Firebase details.`;
-      }
+      message.textContent = `Could not send the verification email (${code}). Check the browser console for Firebase details.`;
     } finally {
       resendButton.disabled = false;
     }
@@ -1335,7 +1374,10 @@ function startRealtimeSync() {
     startPrivateAdminSync();
     startAdminManagementSync();
     startRegularWorkAdminSync();
-    if (recoveryPending) runSparkMigration();
+    if (recoveryPending) {
+      window.dispatchEvent(new CustomEvent('firebase-recovery-progress'));
+      runSparkMigration();
+    }
     else if (recoveryContext?.marker?.status !== 'completed') {
       set(ref(database, migrationMetadataPath), {
         migrationId,

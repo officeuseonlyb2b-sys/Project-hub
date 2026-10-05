@@ -75,7 +75,7 @@ for (const profile of profiles) {
 const employeeRecords = new Map();
 for (const [key, record] of [...entries(management.users), ...entries(legacyDirectory.users)]) {
   const appUserId = String(record?.appUserId || record?.id || key || '');
-  if (!appUserId || String(record?.email || '').toLowerCase() === adminEmail) continue;
+  if (!appUserId || appUserId === 'u1' || String(record?.email || '').toLowerCase() === adminEmail) continue;
   if (!employeeRecords.has(appUserId)) employeeRecords.set(appUserId, record);
 }
 const employeeMappings = [];

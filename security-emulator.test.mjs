@@ -119,7 +119,7 @@ function runScopedMigrationPlannerChecks() {
     users: [
       { id: appA, appUserId: appA, authUid: uidA, email: 'employee-a@example.test', status: 'active', name: 'Employee A' },
       { id: appInactive, appUserId: appInactive, authUid: uidInactive, email: 'inactive@example.test', status: 'exited', name: 'Inactive' },
-      { id: 'u1', appUserId: 'u1', authUid: trustedSystemAdminUid, email: systemAdminEmail, status: 'active', name: 'Admin' }
+      { id: 'u1', appUserId: 'u1', authUid: 'old-admin-auth-uid', email: 'ashish@arpitatravels.com', status: 'active', role: 'Director / Admin', name: 'Admin' }
     ],
     departments: [{ id: 'dept-eng', name: 'Engineering', headId: appA }],
     projects: [{ id: 'project-a', name: 'Project A', team: [appA, appInactive], projectLead: appA }],
@@ -137,6 +137,7 @@ function runScopedMigrationPlannerChecks() {
   assert.equal(plan.counts.userViews, 1);
   assert.equal(plan.counts.safeDirectoryUsers, 2);
   assert.equal(plan.counts.retainedLegacyActivity, 1);
+  assert.equal(Object.hasOwn(plan.updates, 'executionHub/userViews/old-admin-auth-uid'), false);
   assert.equal(plan.updates[`executionHub/userViews/${uidA}`].projectAccess['project-a'], true);
   assert.equal(plan.updates[`executionHub/userViews/${uidA}`].taskAccess['task-a'], true);
   assert.equal(plan.updates[`executionHub/userViews/${uidA}`].projectTaskAccess['task-a'], true);

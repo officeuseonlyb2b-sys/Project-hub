@@ -46,7 +46,9 @@
     const blockers = new Set();
     const updates = {};
     const employees = entries(state.users).map(([key, record]) => ({ ...record, id: String(record.id ?? key) }))
-      .filter(employee => String(employee.email || '').toLowerCase() !== ADMIN_EMAIL.toLowerCase());
+      .filter(employee => employee.id !== 'u1'
+        && String(employee.appUserId || '') !== 'u1'
+        && String(employee.email || '').toLowerCase() !== ADMIN_EMAIL.toLowerCase());
     const uidByAppId = new Map();
     const activeUids = new Set();
     const statusByUid = new Map();

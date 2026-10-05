@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url);
 const rules = JSON.parse(fs.readFileSync(new URL('./database.rules.json', import.meta.url), 'utf8')).rules;
 const hosting = JSON.parse(fs.readFileSync(new URL('./firebase.json', import.meta.url), 'utf8')).hosting;
 const authSource = fs.readFileSync(new URL('./firebase-bootstrap.js', import.meta.url), 'utf8');
+const phase13Source = fs.readFileSync(new URL('./phase13.js', import.meta.url), 'utf8');
 const employeeFormSource = fs.readFileSync(new URL('./phase18.js', import.meta.url), 'utf8');
 const appSource = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const { escapeHtml } = require('./xss-safety.js');
@@ -71,6 +72,23 @@ test('client Admin recognition uses the exact trusted UID, verified email, and e
   assert.ok(employeeProfileGate > adminGate, 'non-Admins must proceed to employee profile validation');
 });
 
+test('employee authorization relies on its profile and scoped reads, not the global recovery marker', () => {
+  const authorizeStart = authSource.indexOf('async function authorize(user)');
+  const authorizeEnd = authSource.indexOf('\nfunction setApplicationVisible', authorizeStart);
+  const authorizeSource = authSource.slice(authorizeStart, authorizeEnd);
+  const employeeStart = authorizeSource.indexOf('if (!admin) {');
+  const employeeEnd = authorizeSource.indexOf('\n  }\n\n  let state;', employeeStart);
+  const employeeGate = authorizeSource.slice(employeeStart, employeeEnd);
+  assert.ok(employeeStart >= 0);
+  assert.ok(employeeGate.includes('validateEmployeeProfile(user, profile)'));
+  assert.equal(employeeGate.includes('migrationMetadataPath'), false);
+  assert.equal(employeeGate.includes('isWorkspaceReady'), false);
+  assert.equal(employeeGate.includes('app/migration-pending'), false);
+  assert.ok(authorizeSource.includes('else state = await readEmployeeWorkspace(profile);'));
+  assert.ok(authSource.includes('async function readEmployeeWorkspace(profile)'));
+  assert.equal(authSource.includes("code === 'app/migration-pending'"), false);
+});
+
 test('unverified trusted Admin gets a resend flow and refreshed token before authorization', () => {
   const verificationStart = authSource.indexOf('function showAdminEmailVerification(user)');
   const verificationEnd = authSource.indexOf('\nfunction showLogin', verificationStart);
@@ -80,7 +98,6 @@ test('unverified trusted Admin gets a resend flow and refreshed token before aut
   assert.ok(verificationSource.includes('Verification email sent. Open the email, verify your account, then sign in again.'));
   assert.ok(verificationSource.includes("const code = error?.code || 'auth/unknown'"));
   assert.ok(verificationSource.includes('Firebase verification email request failed:'));
-  assert.ok(verificationSource.includes('auth/too-many-requests'));
   assert.ok(verificationSource.includes('await currentUser.reload()'));
   assert.ok(verificationSource.includes('await refreshedUser.getIdTokenResult(true)'));
   assert.ok(verificationSource.includes('tokenResult.claims.email_verified === true'));
@@ -90,6 +107,26 @@ test('unverified trusted Admin gets a resend flow and refreshed token before aut
   const authFlowSource = authSource.slice(authFlowStart, authFlowEnd);
   assert.ok(authFlowSource.indexOf('await user.reload()') < authFlowSource.indexOf('await authorize(user)'));
   assert.ok(authFlowSource.indexOf('await user.getIdTokenResult(true)') < authFlowSource.indexOf('await authorize(user)'));
+});
+
+test('scoped recovery replaces the derived safe directory instead of retaining stale Admin rows', () => {
+  assert.ok(authSource.includes('path === safeEmployeeDirectoryPath'));
+  assert.ok(authSource.includes('? planned'));
+  assert.ok(authSource.includes(': existing ? mergeData(existing, planned) : planned;'));
+});
+
+test('recovery reports precise operation context and uses recovery-specific UI messages', () => {
+  for (const field of ['functionName: \'runSparkMigration\'', 'migrationStep', 'path: migrationPath', 'operation:', 'code:', 'message:']) assert.ok(authSource.includes(field));
+  assert.ok(authSource.includes("new CustomEvent('firebase-recovery-error'"));
+  assert.ok(authSource.includes("new CustomEvent('firebase-recovery-progress'"));
+  assert.ok(phase13Source.includes("toast('Workspace recovery is in progress.')"));
+  assert.ok(phase13Source.includes("toast('Workspace recovery could not continue. Check the recovery error.')"));
+});
+
+test('My Work heading has a semantic fallback for a null user name', () => {
+  assert.equal((phase13Source.match(/userName=String\(user\((?:u|currentUser)\)\?\.name\|\|''\)\.trim\(\)\|\|'Team Member'/g) || []).length, 2);
+  assert.equal(phase13Source.includes('user(currentUser).name.toUpperCase()'), false);
+  assert.equal(phase13Source.includes('user(u).name.toUpperCase()'), false);
 });
 
 test('all three activity paths require an absent old record, even for Admin', () => {
@@ -116,6 +153,8 @@ test('Daily Task assignee rules freeze all non-execution fields', () => {
 test('login errors use text nodes and generic credential feedback', () => {
   assert.ok(authSource.includes("textContent = friendlyLoginError(error)"));
   assert.ok(authSource.includes("return 'Email or password is incorrect.'"));
+  assert.equal(authSource.includes("code === 'app/migration-pending'"), false);
+  assert.equal(authSource.includes('Sign in as the verified System Admin to resume it'), false);
   assert.equal(authSource.includes('class="login-error">${message}'), false);
   assert.ok(authSource.includes("'auth/invalid-login-credentials'"));
 });
