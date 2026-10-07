@@ -177,3 +177,19 @@ test('passwords are stripped before RTDB saves and never written to browser stor
   assert.doesNotMatch(source, /(?:localStorage|sessionStorage)\.(?:setItem|set)\s*\([^\r\n]*(?:password|passwd|pwd)/i);
   assert.doesNotMatch(source, /\blog(?:Org|Account)?\s*\([^\r\n]*(?:password|temporaryPassword)/i);
 });
+
+test('Regular Work structural edits use only targeted record saves', () => {
+  const folderHandler = phase19Source.slice(phase19Source.indexOf('openFolderForm=function'), phase19Source.indexOf('openCategoryForm=function'));
+  const categoryHandler = phase19Source.slice(phase19Source.indexOf('openCategoryForm=function'), phase19Source.indexOf('function openParentTaskForm'));
+  const taskHandler = phase19Source.slice(phase19Source.indexOf('function openParentTaskForm'), phase19Source.indexOf('function archiveParentTask'));
+  assert.ok(folderHandler.includes('saveRegularWorkFolder'));
+  assert.ok(categoryHandler.includes('saveRegularWorkCategory'));
+  assert.ok(taskHandler.includes('saveRegularWorkTask'));
+  for (const handler of [folderHandler, categoryHandler, taskHandler]) {
+    assert.doesNotMatch(handler, /saveRegularWorkState|\/approvals\/|\/comments\/|\/dailyTasks\//);
+  }
+  assert.ok(authSource.includes("console.info('[RW SAVE] folder:'"));
+  assert.ok(authSource.includes('Folder read-back failed'));
+  assert.ok(authSource.includes('Category read-back failed'));
+  assert.ok(authSource.includes('Task read-back failed'));
+});

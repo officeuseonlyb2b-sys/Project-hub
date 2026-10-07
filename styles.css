@@ -671,3 +671,6 @@ body.dwp-page-active:not(.dwp-share-mode) .dwp-next-meeting small{font-size:8.5p
 body.dwp-page-active:not(.dwp-share-mode) .dwp-next-meeting strong{font-size:11.5px}
 body.dwp-page-active:not(.dwp-share-mode) .dwp-next-meeting span{font-size:9.5px}
 body.dwp-page-active:not(.dwp-share-mode) .dwp-empty-inline,body.dwp-page-active:not(.dwp-share-mode) .dwp-footnote{font-size:9.5px}
+.rw-ellipsis{border:0;background:transparent;color:var(--muted,#667085);font:700 18px/1 inherit;cursor:pointer;padding:2px 6px;border-radius:7px;vertical-align:middle}
+.rw-ellipsis:hover,.rw-ellipsis:focus-visible{background:#eef1f6;color:var(--ink,#172033);outline:none}
+.rw-structure-menu{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;min-width:26px;min-height:26px;margin-left:auto;color:#425a4c;background:#f3f7f4;border:1px solid #dce8df;cursor:pointer}

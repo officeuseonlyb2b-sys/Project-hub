@@ -1466,7 +1466,13 @@ async function saveRegularWorkData(state) {
       const ownerUid = record.ownerUid;
       if (!ownerUid || (!admin && ownerUid !== actorUid)) continue;
       if (JSON.stringify(oldById.get(record.id)) === JSON.stringify(record)) continue;
-      await set(ref(database, `${regularWorkOwnersPath}/${ownerUid}/${collection}/${record.id}`), record);
+      const recordPath = `${regularWorkOwnersPath}/${ownerUid}/${collection}/${record.id}`;
+      await set(ref(database, recordPath), record);
+      const readBack = await get(ref(database, recordPath));
+      const savedRecord = readBack.exists() ? readBack.val() : null;
+      if (!savedRecord || savedRecord.id !== record.id || savedRecord.name !== record.name) {
+        throw new Error(`Regular Work ${collection} read-back failed at ${recordPath}.`);
+      }
     }
   };
   await upsertOwned('folders', previous.folders);
@@ -1478,7 +1484,13 @@ async function saveRegularWorkData(state) {
     const old = oldTasks.get(taskId);
     if (JSON.stringify(old) === JSON.stringify(task)) continue;
     const savedTask = { ...task, createdByUid: task.createdByUid || actorUid };
-    await set(ref(database, `${regularWorkTasksPath}/${taskId}`), savedTask);
+    const taskPath = `${regularWorkTasksPath}/${taskId}`;
+    await set(ref(database, taskPath), savedTask);
+    const readBack = await get(ref(database, taskPath));
+    const savedTaskReadBack = readBack.exists() ? readBack.val() : null;
+    if (!savedTaskReadBack || savedTaskReadBack.id !== taskId || savedTaskReadBack.title !== savedTask.title) {
+      throw new Error(`Regular Work task read-back failed at ${taskPath}.`);
+    }
   }
 
   for (const [taskId, accessUids] of Object.entries(next.access)) {
@@ -1564,6 +1576,65 @@ window.firebaseHub = {
     if (isSystemAdmin() || lastRegularWorkSnapshot.tasks.some(task => task.id === taskId)) return true;
     const task = window.getFirebaseApplicationState?.().tasks.find(item => item.id === taskId && item.contextType === 'regular_work');
     return !!task && !!auth.currentUser?.uid && (task.createdByUid === auth.currentUser.uid || task.folderOwnerUid === auth.currentUser.uid || task.owner === employeeProfile?.appUserId || (task.accessUserIds || []).includes(employeeProfile?.appUserId));
+  },
+  async deleteEmptyRegularWorkRecord(collection, ownerUid, recordId) {
+    if (!['folders', 'categories'].includes(collection) || !ownerUid || !recordId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) {
+      throw new Error('You do not have permission to delete this Regular Work record.');
+    }
+    await set(ref(database, `${regularWorkOwnersPath}/${ownerUid}/${collection}/${recordId}`), null);
+  },
+  async saveRegularWorkState(nextState) {
+    if (!auth.currentUser) throw new Error('Firebase authentication is required to save Regular Work.');
+    await saveRegularWorkData(nextState);
+    return true;
+  },
+  async saveRegularWorkFolder(ownerUid, folderId, patch, taskLabelPatches = []) {
+    if (!ownerUid || !folderId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) throw new Error('You do not have permission to edit this folder.');
+    const folderPath = `${regularWorkOwnersPath}/${ownerUid}/folders/${folderId}`;
+    const allowed = ['name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    console.info('[RW SAVE] folder:', folderPath);
+    await update(ref(database, folderPath), safePatch);
+    for (const item of taskLabelPatches) {
+      if (!item?.taskId) continue;
+      const taskPath = `${regularWorkTasksPath}/${item.taskId}`;
+      console.info('[RW SAVE] task label:', taskPath);
+      await update(ref(database, taskPath), item.patch || {});
+    }
+    const saved = await get(ref(database, folderPath));
+    const record = saved.exists() ? saved.val() : null;
+    if (!record || record.id !== folderId || ('name' in safePatch && record.name !== safePatch.name)) throw new Error(`Folder read-back failed at ${folderPath}.`);
+    return record;
+  },
+  async saveRegularWorkCategory(ownerUid, categoryId, patch, taskLabelPatches = []) {
+    if (!ownerUid || !categoryId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) throw new Error('You do not have permission to edit this category.');
+    const categoryPath = `${regularWorkOwnersPath}/${ownerUid}/categories/${categoryId}`;
+    const allowed = ['name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    console.info('[RW SAVE] category:', categoryPath);
+    await update(ref(database, categoryPath), safePatch);
+    for (const item of taskLabelPatches) {
+      if (!item?.taskId) continue;
+      const taskPath = `${regularWorkTasksPath}/${item.taskId}`;
+      console.info('[RW SAVE] task label:', taskPath);
+      await update(ref(database, taskPath), item.patch || {});
+    }
+    const saved = await get(ref(database, categoryPath));
+    const record = saved.exists() ? saved.val() : null;
+    if (!record || record.id !== categoryId || ('name' in safePatch && record.name !== safePatch.name)) throw new Error(`Category read-back failed at ${categoryPath}.`);
+    return record;
+  },
+  async saveRegularWorkTask(taskId, patch) {
+    if (!taskId || !auth.currentUser) throw new Error('You do not have permission to edit this task.');
+    const taskPath = `${regularWorkTasksPath}/${taskId}`;
+    const allowed = ['title', 'status', 'priority', 'owner', 'currentDue', 'waitingOn', 'next', 'updatedAt', 'updatedBy', 'updatedByUid', 'archived', 'archivedAt', 'archivedByUid'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    console.info('[RW SAVE] task:', taskPath);
+    await update(ref(database, taskPath), safePatch);
+    const saved = await get(ref(database, taskPath));
+    const record = saved.exists() ? saved.val() : null;
+    if (!record || record.id !== taskId || ('title' in safePatch && record.title !== safePatch.title)) throw new Error(`Task read-back failed at ${taskPath}.`);
+    return record;
   },
   async getRegularWorkDailyTasks(parentTaskId) {
     if (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId)) throw new Error('You do not have access to this Regular Work task.');
