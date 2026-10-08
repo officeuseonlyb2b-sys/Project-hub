@@ -17,14 +17,12 @@
   const timeText=value=>value?new Date(value).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'';
   const fullDate=value=>value?parseDate(value).toLocaleDateString('en-GB',{weekday:'long',day:'2-digit',month:'long',year:'numeric'}):'';
   const itemDate=item=>String(item.dueDate||'').slice(0,10);
-  const isTerminal=item=>item.archived===true||['completed','cancelled','canceled','archived'].includes(String(item.status||'').toLowerCase());
-  const overdueState=item=>!isTerminal(item)&&item.status!=='Ready for Review';
+  const isTerminal=item=>item.deleted===true||item.archived===true||['completed','cancelled','canceled','archived','discarded'].includes(String(item.status||'').toLowerCase());
+  const overdueState=item=>!isTerminal(item);
   const priorityWeight=priority=>priority==='P0'?4:priority==='P1'?3:priority==='P2'?2:1;
   const priorityLabel=priority=>({P0:'P0 · Critical',P1:'P1 · High',P2:'P2 · Medium',P3:'P3 · Low'})[priority]||priority||'—';
   let dateFilter='today',workFilter='all',scopeFilter='my',chartDays=7;
   let shareMode=false,drillCleanup=null;
-  let dailyCache=new Map(),dailyListenerStop=null,dailyListenerKey='';
-  let dailyPendingIds=new Set(),dailyHydrationError='';
   const title='My Work Snapshot';
 
   function isAdminReviewingEmployee(){return isAdmin()&&uid()!==state.currentUser}
@@ -67,16 +65,17 @@
   }
   function cancellationTime(item){
     if(item.cancelledAt)return item.cancelledAt;
-    if(item.kind==='daily')return '';
+    if(String(item.status||'').toLowerCase()==='discarded')return item.discardedAt||'';
     return activityForTask(item.parentId).findLast?.(event=>/cancel(?:led|ed)/i.test(`${event.text||''} ${event.change||''}`))?.time||'';
   }
   function mappedParent(task){
     const project=task.project?projectById(task.project):null;
-    const folder=task.contextType==='regular_work'?(state.regularWorkFolders||[]).find(item=>item.id===task.regularFolderId):null;
-    const category=task.contextType==='regular_work'?(state.regularWorkCategories||[]).find(item=>item.id===task.regularCategoryId):null;
+    const folder=task.contextType==='regular_work'?(state.regularWorkFolders||[]).find(item=>item.id===(task.folderId||task.regularFolderId)):null;
+    const category=task.contextType==='regular_work'?(state.regularWorkCategories||[]).find(item=>item.id===(task.categoryId||task.regularCategoryId)):null;
     const source=task.contextType==='regular_work'?'Regular Work':'Project Work';
     const detail=task.contextType==='regular_work'?[folder?.name||task.regularFolderName,category?.name||task.regularCategoryName].filter(Boolean).join(' · '):[project?.name,task.workstream].filter(Boolean).join(' · ');
-    return {id:task.id,parentId:task.id,kind:'task',contextType:task.contextType==='regular_work'?'regular':'project',title:task.title||'Untitled task',status:task.status||'Not Started',priority:task.priority||'',dueDate:task.currentDue||task.originalDue||'',completedAt:completionTime(task),createdAt:creationTime(task),assignedAt:assignmentTime(task),owner:task.owner,source,sourceDetail:detail,record:task,parentTask:task,waitingOn:task.waitingOn||'',project:task.project||null};
+    const status=task.contextType==='regular_work'&&task.status==='Not Started'?'Pending':task.status||'Pending';
+    return {id:task.id,parentId:task.id,kind:'task',contextType:task.contextType==='regular_work'?'regular':'project',title:task.title||'Untitled task',status,priority:task.priority||'',dueDate:task.currentDue||task.originalDue||'',completedAt:completionTime(task),createdAt:creationTime(task),assignedAt:assignmentTime(task),owner:task.owner,source,sourceDetail:detail,record:task,parentTask:task,waitingOn:task.waitingOn||'',project:task.project||null,deleted:task.deleted===true,archived:task.archived===true};
   }
   function projectScopeAllows(task,scope){
     const project=projectById(task.project);
@@ -92,16 +91,13 @@
   }
   function parentTasksForScope(scope=scopeFilter,type=workFilter){
     return (state.tasks||[]).filter(task=>{
+      if(task.deleted===true||task.archived===true)return false;
       const regular=task.contextType==='regular_work';
       if(type==='regular'&&!regular)return false;
       if(type==='project'&&regular)return false;
       if(regular)return parentTaskScopeAllows(task,scope);
       return projectScopeAllows(task,scope);
     });
-  }
-  function dailyParentsForScope(scope=scopeFilter,type=workFilter){
-    if(scope!=='my')return parentTasksForScope(scope,type).filter(task=>task.contextType==='regular_work');
-    return (state.tasks||[]).filter(task=>task.contextType==='regular_work'&&type!=='project'&&accessibleTask(task));
   }
   function departmentPeople(){
     if(allEmployeesSelected())return new Set((state.users||[]).filter(person=>person.active!==false&&person.id!=='u1').map(person=>person.id));
@@ -110,56 +106,19 @@
   }
   function scopeItems(scope=scopeFilter,type=workFilter){
     let parents=parentTasksForScope(scope,type);
-    let dailyParents=dailyParentsForScope(scope,type);
     let departmentMembers=null;
     if(scope==='department'&&isAdmin()){
       departmentMembers=departmentPeople();
-      parents=parents.filter(task=>departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)
-        ||(task.contextType==='regular_work'&&(dailyCache.get(task.id)||[]).some(child=>[...departmentMembers].some(member=>matchesPerson(child.assignedTo,member)))));
-      dailyParents=dailyParents.filter(task=>departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)
-        ||(dailyCache.get(task.id)||[]).some(child=>[...departmentMembers].some(member=>matchesPerson(child.assignedTo,member))));
+      parents=parents.filter(task=>departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner));
     }
     const items=parents.filter(task=>scope!=='department'||!isAdmin()||departmentMembers.has(dailyWorkModel.resolveEmployee(task.owner,state.users)?.id||task.owner)).map(mappedParent);
-    const dailyItems=[];
-    for(const parent of dailyParents){
-      for(const child of dailyCache.get(parent.id)||[]){
-        const item=dailyWorkModel.normalizeDailyTask(parent,child,state.users);
-        if(!item)continue;
-        dailyItems.push(item);
-      }
-    }
-    items.push(...dailyWorkModel.filterDailyItems(dailyItems,{
-      scope:scope==='department'&&isAdmin()?'department':scope,
-      allEmployees:allEmployeesSelected(),
-      employeeId:uid(),
-      departmentIds:departmentMembers?[...departmentMembers]:[],
-      employees:state.users
-    }));
     return dailyWorkModel.uniqueWorkItems(items);
-  }
-  function syncDailyListeners(parents){
-    const ids=[...new Set(parents.filter(task=>task.contextType==='regular_work').map(task=>task.id))].sort();
-    const key=ids.join('|');
-    if(key===dailyListenerKey)return;
-    if(dailyListenerStop){dailyListenerStop();dailyListenerStop=null}
-    dailyListenerKey=key;
-    dailyPendingIds=new Set(ids);dailyHydrationError='';
-    if(!ids.length||!window.firebaseHub?.watchRegularWorkDailyTasks)return;
-    dailyListenerStop=window.firebaseHub.watchRegularWorkDailyTasks(ids,(parentTaskId,records)=>{
-      dailyCache.set(parentTaskId,records||[]);dailyPendingIds.delete(parentTaskId);
-      if(activeView==='dailywork'&&!shareMode&&!dailyPendingIds.size)renderDailyWork();
-      if(shareMode)renderShareSnapshot();
-    },(parentTaskId,error)=>{
-      if(parentTaskId)dailyPendingIds.delete(parentTaskId);else dailyPendingIds.clear();
-      dailyHydrationError=error?.message||'Some authorized Daily Tasks could not be loaded.';
-      if(activeView==='dailywork'&&!shareMode&&!dailyPendingIds.size)renderDailyWork();
-    });
   }
   function completedInWindow(items,window=dateWindow()){
     return items.filter(item=>item.status==='Completed'&&inWindow(item.completedAt,window));
   }
   function dueInWindow(items,window=dateWindow()){
-    return items.filter(item=>inWindow(item.dueDate,window)&&item.status!=='Cancelled'&&item.status!=='Canceled');
+    return items.filter(item=>!isTerminal(item)&&inWindow(item.dueDate,window));
   }
   function overdueItems(items,asOf=windowEnd(dateWindow())){
     return items.filter(item=>item.dueDate&&item.dueDate<asOf&&overdueState(item));
@@ -225,16 +184,11 @@
     };
   }
   function taskActivityEvent(item,predicate,window=dateWindow()){
-    if(item.kind==='daily')return false;
     return activityForItem(item).some(event=>inWindow(event.time,window)&&predicate(event));
   }
   function activityForItem(item){return (state.activity||[]).filter(event=>event.task===item.parentId||event.regularWorkTaskId===item.parentId)}
-  function dailyCreated(item,window=dateWindow()){
-    return item.kind==='daily'&&inWindow(item.createdAt,window);
-  }
   function taskCreatedOrAssigned(item,window=dateWindow()){
-    if(dailyCreated(item,window)||inWindow(item.createdAt,window))return true;
-    if(item.kind==='daily')return (state.activity||[]).some(event=>event.task===item.parentId&&event.type==='Daily Task'&&String(event.text||'').includes(item.title)&&/reassign|added/i.test(event.text||'')&&inWindow(event.time,window));
+    if(inWindow(item.createdAt,window))return true;
     return taskActivityEvent(item,event=>event.type==='Task'&&/creat/i.test(event.text||''),window)||taskActivityEvent(item,event=>event.type==='Assignment',window);
   }
   function movementCounts(items,approvals,window=dateWindow()){
@@ -242,8 +196,8 @@
     const completed=completedInWindow(items,window);
     const sent=approvals.filter(item=>inWindow(item.requestedAt,window));
     const changes=approvals.filter(item=>item.status==='Changes Requested'&&inWindow(approvalChangeTime(item),window));
-    const cancelled=items.filter(item=>['Cancelled','Canceled'].includes(item.status)&&inWindow(cancellationTime(item),window)).concat(approvals.filter(item=>item.status==='Cancelled'&&inWindow(item.cancelledAt||item.completedAt,window)));
-    const waiting=items.filter(item=>!isTerminal(item)&&(item.waitingOn||['Waiting','Blocked'].includes(item.status)));
+    const cancelled=items.filter(item=>['Cancelled','Canceled','Discarded'].includes(item.status)&&inWindow(cancellationTime(item),window)).concat(approvals.filter(item=>item.status==='Cancelled'&&inWindow(item.cancelledAt||item.completedAt,window)));
+    const waiting=items.filter(item=>!isTerminal(item)&&(item.status==='On Hold'||item.waitingOn||['Waiting','Blocked'].includes(item.status)));
     return {newItems,completed,sent,changes,cancelled,waiting};
   }
   function nextMeeting(events){
@@ -265,7 +219,7 @@
     return `<select class="dwp-select" id="dwpEmployeeSnapshot" aria-label="Employee snapshot"><option value="" ${snapshotEmployeeId?'':'selected'}>All Employees</option>${employees.map(person=>`<option value="${esc(person.id)}" ${snapshotEmployeeId===person.id?'selected':''}>${esc(person.name||person.email||person.id)}${person.active===false?' · Inactive':''}</option>`).join('')}</select>`;
   }
   function taskSource(item){return item.sourceDetail?`${item.source} · ${item.sourceDetail}`:item.source}
-  function statusClass(status){if(status==='Completed')return 'completed';if(['Waiting','Blocked'].includes(status))return 'waiting';if(['Ready for Review','Changes Required'].includes(status))return 'review';if(['Cancelled','Canceled'].includes(status))return 'cancelled';return 'progress'}
+  function statusClass(status){if(status==='Completed')return 'completed';if(['On Hold','Waiting','Blocked'].includes(status))return 'waiting';if(['Ready for Review','Changes Required'].includes(status))return 'review';if(['Cancelled','Canceled','Discarded'].includes(status))return 'cancelled';return 'progress'}
   function priorityClass(priority){const classes={P0:'p0',P1:'p1',P2:'p2',P3:'p3'};return Object.hasOwn(classes,priority)?classes[priority]:'p2'}
   function taskRow(item){
     const contextClass=item.contextType==='regular_work'?'regular':'project';
@@ -295,14 +249,13 @@
     return dailyWorkModel.getWorkMetrics(items,window,today()).table;
   }
   function isNewInWindow(item,window=dateWindow()){
-    if(item.kind==='daily')return taskCreatedOrAssigned(item,window);
     return inWindow(item.createdAt,window)||inWindow(item.assignedAt,window)||taskActivityEvent(item,event=>event.type==='Assignment'||event.type==='Task',window);
   }
   function calculateKpis(items,approvals,events,window=dateWindow()){
     const workMetrics=dailyWorkModel.getWorkMetrics(items,window,today());
     const {due,overdue,completed,pending}=workMetrics;
-    const review=reviewItems(items,approvals,window),waiting=items.filter(item=>!isTerminal(item)&&(item.waitingOn||['Waiting','Blocked'].includes(item.status)));
-    const cancelled=items.filter(item=>['Cancelled','Canceled'].includes(item.status)&&inWindow(cancellationTime(item),window)).concat(approvals.filter(item=>item.status==='Cancelled'&&inWindow(item.cancelledAt||item.completedAt,window)));
+    const review=reviewItems(items,approvals,window),waiting=items.filter(item=>!isTerminal(item)&&(item.status==='On Hold'||item.waitingOn||['Waiting','Blocked'].includes(item.status)));
+    const cancelled=items.filter(item=>['Cancelled','Canceled','Discarded'].includes(item.status)&&inWindow(cancellationTime(item),window)).concat(approvals.filter(item=>item.status==='Cancelled'&&inWindow(item.cancelledAt||item.completedAt,window)));
     const meetings=events.filter(event=>event.type==='meeting'&&inWindow(event.date,window));
     const active=workMetrics.active;
     const newToday=items.filter(item=>isNewInWindow(item,window));
@@ -313,11 +266,11 @@
   }
   function countPill(items){return items.length.toLocaleString('en-US')}
   function renderKpiGrid(metrics){
-    const cards=[['Pending Today',metrics.pending,'blue','Open work due by the end of this range'],['Overdue',metrics.overdue,'red','Open items past due'],['Due Today',metrics.due,'amber','Items due in this range'],['New Today',metrics.created,'purple','Created or assigned in this range'],['In Review',metrics.review,'purple','Review states and linked approvals'],['Waiting',metrics.waiting,'blue','Items waiting on people or dependencies'],['Completed',metrics.completed,'green','Completed in this range'],['Cancelled',metrics.cancelled,'muted','Cancelled work/approvals where recorded'],['Meetings',metrics.meetings,'purple','Planner meetings in this range'],['Active Load',metrics.active,'teal','All open work in this scope']];
+    const cards=[['Pending Today',metrics.pending,'blue','Open work due by the end of this range'],['Overdue',metrics.overdue,'red','Open items past due'],['Due Today',metrics.due,'amber','Items due in this range'],['New Today',metrics.created,'purple','Created or assigned in this range'],['In Review',metrics.review,'purple','Review states and linked approvals'],['Waiting',metrics.waiting,'blue','Items waiting on people or dependencies'],['Completed',metrics.completed,'green','Completed in this range'],['Cancelled',metrics.cancelled,'muted','Discarded tasks and cancelled approvals'],['Meetings',metrics.meetings,'purple','Planner meetings in this range'],['Active Load',metrics.active,'teal','All open work in this scope']];
     return `<div class="dwp-kpi-grid">${cards.map(([label,items,tone,help])=>`<button type="button" class="dwp-kpi ${tone}" data-dwp-kpi="${label}"><span>${label}</span><strong>${countPill(items)}</strong><small>${help}</small></button>`).join('')}</div>`;
   }
   function dayStats(items,events,date){
-    const due=items.filter(item=>itemDate(item)===date&&!['cancelled','canceled','archived'].includes(String(item.status||'').toLowerCase())),completed=items.filter(item=>item.status==='Completed'&&dailyWorkModel.dateOf(item.completedAt)===date),open=due.filter(overdueState),overdue=open.filter(item=>itemDate(item)<date),meetings=events.filter(event=>event.type==='meeting'&&event.date===date),critical=due.filter(item=>item.priority==='P0');
+    const due=items.filter(item=>itemDate(item)===date&&!isTerminal(item)),completed=items.filter(item=>item.status==='Completed'&&item.deleted!==true&&dailyWorkModel.dateOf(item.completedAt)===date),open=due.filter(overdueState),overdue=open.filter(item=>itemDate(item)<date),meetings=events.filter(event=>event.type==='meeting'&&event.date===date),critical=due.filter(item=>item.priority==='P0');
     return {due,completed,overdue,meetings,critical};
   }
   function renderComparison(items,events){
@@ -342,12 +295,6 @@
   }
   function renderMainPage(){
     const windowRange=dateWindow(),parents=parentTasksForScope(scopeFilter,workFilter);
-    syncDailyListeners(dailyParentsForScope(scopeFilter,workFilter));
-    if(dailyPendingIds.size||dailyHydrationError){
-      setTitle(title,'DAILY WORK PERFORMANCE');document.body.classList.add('dwp-page-active');
-      el('content').innerHTML=`<main class="dwp-page"><section class="dwp-card"><div class="dwp-empty-inline">${esc(dailyHydrationError||'Loading authorized Daily Tasks…')}</div></section></main>`;
-      return null;
-    }
     const items=scopeItems(),approvals=authorizedApprovals(scopeFilter,parents),events=calendarEventsForScope(),metrics=calculateKpis(items,approvals,events,windowRange);
     const workloadStart=windowRange.start,workload=workloadValues(items,workloadStart,chartDays),chartMax=Math.max(1,...workload.map(day=>day.count));
     const approvalsGroups=getApprovalGroups(approvals,windowRange),active=activeItemsInWindow(items,windowRange),todayLabel=fullDate(today());
@@ -363,7 +310,6 @@
       <footer class="dwp-footnote">Generated from authorized live Execution Hub data · Date range: ${esc(shortDate(windowRange.start))}–${esc(shortDate(windowRange.end))}</footer>
     </main>`;
     bindMainPage(items,approvals,events,metrics,windowRange,approvalsGroups);
-    if(dailyListenerKey&&!dailyListenerStop){};
     return {items,parents,approvals,events,metrics,windowRange,approvalsGroups,workload,nextMeetingItem};
   }
   function openDrill(title,rows){
@@ -371,12 +317,11 @@
     if(!backdrop){backdrop=document.createElement('div');backdrop.id='dwpDrillBackdrop';backdrop.className='dwp-drill-backdrop';backdrop.innerHTML='<aside id="dwpDrillDrawer" class="dwp-drill-drawer" role="dialog" aria-modal="true"><header><div><span>DAILY WORK PERFORMANCE</span><h2 id="dwpDrillTitle"></h2></div><button id="dwpDrillClose" type="button" aria-label="Close">×</button></header><div id="dwpDrillList" class="dwp-drill-list"></div></aside>';document.body.appendChild(backdrop);backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeDrill()});}
     document.getElementById('dwpDrillTitle').textContent=title;
     const list=document.getElementById('dwpDrillList');
-    list.innerHTML=rows.length?rows.map((row,index)=>`<button type="button" class="dwp-drill-row" data-dwp-drill-row="${index}"><span class="dwp-drill-dot ${row.type==='approval'?'purple':row.kind==='daily'?'teal':row.status==='Completed'?'green':row.priority==='P0'?'red':'blue'}"></span><span><strong>${esc(row.title||row.record?.title||row.name||'Approval')}</strong><small>${esc(row.sub||row.sourceDetail||row.source||'')}</small></span><span>${esc(row.status||row.record?.status||'')}</span></button>`).join(''):'<div class="dwp-empty">No matching live records.</div>';
+    list.innerHTML=rows.length?rows.map((row,index)=>`<button type="button" class="dwp-drill-row" data-dwp-drill-row="${index}"><span class="dwp-drill-dot ${row.type==='approval'?'purple':row.status==='Completed'?'green':row.priority==='P0'?'red':'blue'}"></span><span><strong>${esc(row.title||row.record?.title||row.name||'Approval')}</strong><small>${esc(row.sub||row.sourceDetail||row.source||'')}</small></span><span>${esc(row.status||row.record?.status||'')}</span></button>`).join(''):'<div class="dwp-empty">No matching live records.</div>';
     list.querySelectorAll('[data-dwp-drill-row]').forEach(button=>button.onclick=()=>{
       const row=rows[Number(button.dataset.dwpDrillRow)];
       if(row?.type==='approval'||row?.kind==='approval'){goToView('approvals');closeDrill();return}
       if(row?.type==='meeting'||row?.type==='planner'){goToView('planner');closeDrill();return}
-      if(row?.kind==='daily'){openTask(row.parentId);closeDrill();requestAnimationFrame(()=>document.querySelector(`[data-daily-task-id="${CSS.escape(row.record.id)}"]`)?.scrollIntoView({block:'center',behavior:'smooth'}));return}
       const record=row?.record||row;if(record?.id){closeDrill();openTask(record.id)}
     });
     document.getElementById('dwpDrillClose').onclick=closeDrill;
@@ -408,7 +353,6 @@
   }
   function openTaskForItem(items,id){
     const item=items.find(candidate=>candidate.id===id);if(!item)return;
-    if(item.kind==='daily'){openTask(item.parentId);requestAnimationFrame(()=>document.querySelector(`[data-daily-task-id="${CSS.escape(item.record.id)}"]`)?.scrollIntoView({block:'center',behavior:'smooth'}));return}
     openTask(item.parentId);
   }
   function snapshotMovement(items,approvals,window){
@@ -448,18 +392,13 @@
     if(shareMode)return renderShareSnapshot();
     renderMainPage();
   }
-  window.addEventListener('regular-daily-tasks-updated',event=>{
-    const parentTaskId=event.detail?.parentTaskId,records=event.detail?.records;if(!parentTaskId||!Array.isArray(records))return;
-    dailyCache.set(parentTaskId,records);if(activeView==='dailywork')renderDailyWork();if(shareMode)renderShareSnapshot();
-  });
   const originalRefresh=window.refreshFirebaseView;
   window.refreshFirebaseView=function(...args){const result=originalRefresh?.apply(this,args);if(activeView==='dailywork'&&!shareMode)renderDailyWork();else if(shareMode)renderShareSnapshot();return result};
   const baseRender=render;
   render=function(search=''){
-    if(activeProject){document.body.classList.remove('dwp-page-active');stopDailyWatchers();return baseRender(search)}
+    if(activeProject){document.body.classList.remove('dwp-page-active');return baseRender(search)}
     if(activeView==='dailywork'){renderDailyWork();wireDynamic();return}
-    document.body.classList.remove('dwp-page-active');stopDailyWatchers();return baseRender(search);
+    document.body.classList.remove('dwp-page-active');return baseRender(search);
   };
-  function stopDailyWatchers(){if(dailyListenerStop){dailyListenerStop();dailyListenerStop=null}dailyListenerKey='';dailyPendingIds=new Set()}
   render();
 })();

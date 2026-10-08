@@ -67,7 +67,8 @@ function runDailyWorkModelChecks() {
     { id: 'daily-overdue', title: 'Overdue', assignedTo: appA, date: '2026-10-04', status: 'Not Started' },
     { id: 'daily-upcoming', title: 'Upcoming', assignedTo: appA, date: '2026-10-06', status: 'In Progress' },
     { id: 'daily-employee-b', title: 'Employee B', assignedTo: uidB, date: '2026-10-05', status: 'Not Started' },
-    { id: 'daily-archived', title: 'Archived', assignedTo: appA, date: '2026-10-05', status: 'Not Started', archived: true }
+    { id: 'daily-archived', title: 'Archived', assignedTo: appA, date: '2026-10-05', status: 'Not Started', archived: true },
+    { id: 'daily-deleted', title: 'Deleted', assignedTo: appA, date: '2026-10-05', status: 'Completed', completedAt: '2026-10-05T12:00:00.000Z', deleted: true }
   ];
   const normalized = records.map(record => dailyWorkModel.normalizeDailyTask(parent, record, employees)).filter(Boolean);
   const range = { start: '2026-10-05', end: '2026-10-05' };
@@ -85,7 +86,7 @@ function runDailyWorkModelChecks() {
   assert.equal(departmentItems.length, 5);
   assert.equal(teamItems.length, 6);
   assert.equal(allEmployeeItems.length, 6);
-  assert.equal(employeeAMetrics.pending.length, 3);
+  assert.equal(employeeAMetrics.pending.length, 2);
   assert.equal(employeeAMetrics.due.length, 2);
   assert.equal(employeeAMetrics.overdue.length, 1);
   assert.equal(employeeAMetrics.completed.length, 1);
@@ -93,6 +94,7 @@ function runDailyWorkModelChecks() {
   assert.equal(employeeAMetrics.upcoming.length, 1);
   assert.equal(employeeAMetrics.created.length, 2);
   assert.equal(employeeAMetrics.table.some(item => item.sourceId === 'daily-completed'), true);
+  assert.equal(employeeAMetrics.table.some(item => item.sourceId === 'daily-deleted'), false);
   assert.equal(allMetrics.work.length, 6);
   assert.equal(dailyWorkModel.uniqueWorkItems([...normalized, normalized[0]]).length, normalized.length);
 
@@ -316,14 +318,17 @@ async function runMatrix() {
   await expectAllowed('Migrated employee', 'executionHub/shared/tasks/migration-task-a', 'read assigned task after scoped migration', get(ref(migrationEmployee, 'executionHub/shared/tasks/migration-task-a')));
   await expectDenied('Inactive employee', 'executionHub/shared/projects/migration-project-a', 'remain excluded from migrated project', get(ref(inactive, 'executionHub/shared/projects/migration-project-a')));
 
-  const transitionTask = { id: 'rw-status-model', status: 'Not Started' };
+  const transitionTask = { id: 'rw-status-model', status: 'Pending' };
   const statusHistory = [];
   for (const [status, activityVerb] of [
-    ['In Progress', 'changed status from Not Started to In Progress'],
-    ['Ready for Review', 'changed status from In Progress to Ready for Review'],
+    ['In Progress', 'changed status from Pending to In Progress'],
+    ['Working', 'changed status from In Progress to Working'],
+    ['On Hold', 'changed status from Working to On Hold'],
+    ['Working', 'changed status from On Hold to Working'],
+    ['Ready for Review', 'changed status from Working to Ready for Review'],
     ['Completed', 'completed this task'],
-    ['In Progress', 'reopened this task'],
-    ['Completed', 'completed this task']
+    ['Working', 'reopened this task'],
+    ['Discarded', 'discarded this task']
   ]) {
     const transition = createRegularWorkTaskStatusChange(transitionTask, status, uidA, `2026-10-03T10:00:0${statusHistory.length}.000Z`);
     assert.ok(transition);
@@ -331,14 +336,18 @@ async function runMatrix() {
     statusHistory.push(transition.activityVerb);
     assert.equal(transition.activityVerb, activityVerb);
   }
-  assert.equal(transitionTask.status, 'Completed');
-  assert.equal(transitionTask.completedByUid, uidA);
-  assert.match(transitionTask.completedAt, /^2026-10-03T10:00:04/);
-  assert.equal(createRegularWorkTaskStatusChange(transitionTask, 'Completed', uidA, '2026-10-03T11:00:05.000Z'), null, 'repeated completion must not create a second transition/activity');
-  const reopenTransition = createRegularWorkTaskStatusChange(transitionTask, 'In Progress', uidA, '2026-10-03T10:00:05.000Z');
+  assert.equal(transitionTask.status, 'Discarded');
+  assert.equal(transitionTask.discardedByUid, uidA);
+  assert.match(transitionTask.discardedAt, /^2026-10-03T10:00:07/);
+  assert.equal(transitionTask.completedAt, null, 'discarding after a reopen must not retain completion metadata');
+  const completedTransition = createRegularWorkTaskStatusChange({ id: 'rw-complete', status: 'Ready for Review' }, 'Completed', uidA, '2026-10-03T11:00:00.000Z');
+  assert.equal(completedTransition.updates.completedByUid, uidA);
+  assert.equal(completedTransition.updates.completedAt, '2026-10-03T11:00:00.000Z');
+  assert.equal(createRegularWorkTaskStatusChange({ id: 'rw-complete', status: 'Completed' }, 'Completed', uidA, '2026-10-03T11:00:05.000Z'), null, 'same status must not create another transition/activity');
+  const reopenTransition = createRegularWorkTaskStatusChange({ id: 'rw-complete', status: 'Completed', completedAt: '2026-10-03T11:00:00.000Z', completedByUid: uidA }, 'Working', uidA, '2026-10-03T11:00:05.000Z');
   assert.equal(reopenTransition.updates.completedAt, null);
   assert.equal(reopenTransition.updates.completedByUid, null);
-  record('Regular Work task status', 'complete/reopen transition metadata and activity wording', statusHistory.length, 'PASS', 'PASS');
+  record('Regular Work task status', 'seven-state workflow, completion/reopen/discard metadata and activity wording', statusHistory.length, 'PASS', 'PASS');
 
   for (const view of navigableViews) {
     const location = { hash: hashForView(view) };
@@ -578,32 +587,50 @@ async function runMatrix() {
   await expectDenied('Employee B (unrelated Regular Work task)', 'executionHub/regularWork/dailyTasks/rw-a/daily-created-b', 'create Daily Task on unrelated parent', set(ref(b, 'executionHub/regularWork/dailyTasks/rw-a/daily-created-b'), { ...newDailyTask, id: 'daily-created-b', createdByUid: uidB }));
 
   const ownerTaskPath = 'executionHub/regularWork/tasks/rw-a';
-  let ownerTaskRecord = { ...(await get(ref(a, ownerTaskPath))).val(), status: 'Not Started' };
+  let ownerTaskRecord = { ...(await get(ref(a, ownerTaskPath))).val(), status: 'Pending' };
   await expectAllowed('Employee A (Regular Work owner)', ownerTaskPath, 'initialize parent status for Daily Task independence test', set(ref(a, ownerTaskPath), ownerTaskRecord));
   const dailyRecord = (await get(ref(a, 'executionHub/regularWork/dailyTasks/rw-a/daily-a'))).val();
   await expectAllowed('Employee A (Regular Work owner)', 'executionHub/regularWork/dailyTasks/rw-a/daily-a', 'complete child Daily Task', set(ref(a, 'executionHub/regularWork/dailyTasks/rw-a/daily-a'), { ...dailyRecord, status: 'Completed', completedAt: '2026-10-03T10:59:00.000Z' }));
-  assert.equal((await get(ref(a, ownerTaskPath))).val().status, 'Not Started', 'completing a child Daily Task must not complete its parent');
-  const parentTransitions = ['In Progress', 'Ready for Review', 'Completed', 'In Progress', 'Completed'];
+  assert.equal((await get(ref(a, ownerTaskPath))).val().status, 'Pending', 'completing a child Daily Task must not complete its parent');
+  const parentTransitions = ['In Progress', 'Working', 'On Hold', 'Working', 'Ready for Review', 'Completed', 'Working', 'Discarded'];
   for (const [index, status] of parentTransitions.entries()) {
     const transition = createRegularWorkTaskStatusChange(ownerTaskRecord, status, uidA, `2026-10-03T11:00:0${index}.000Z`);
     if (!transition) continue;
     ownerTaskRecord = { ...ownerTaskRecord, ...transition.updates };
-    await expectAllowed('Employee A (Regular Work owner)', ownerTaskPath, `set parent status ${status}`, set(ref(a, ownerTaskPath), ownerTaskRecord));
     const eventId = `status-rwa-${index}`;
-    await expectAllowed('Employee A (Regular Work owner)', `executionHub/regularWork/activity/rw-a/${eventId}`, `write ${transition.activityVerb} activity`, set(ref(a, `executionHub/regularWork/activity/rw-a/${eventId}`), {
+    const activity = {
       id: eventId, task: 'rw-a', user: appA, time: `2026-10-03T11:00:0${index}.000Z`, type: 'Status', text: `${appA} ${transition.activityVerb}`,
-      authorUid: uidA, actorUid: uidA, createdByUid: uidA, contextType: 'regular_work'
-    }));
+      change: `${transition.previousStatus} → ${transition.nextStatus}`, authorUid: uidA, actorUid: uidA, createdByUid: uidA, contextType: 'regular_work'
+    };
+    const relativeUpdates = Object.fromEntries(Object.entries(transition.updates).map(([field, value]) => [`tasks/rw-a/${field}`, value]));
+    relativeUpdates[`activity/rw-a/${eventId}`] = activity;
+    await expectAllowed('Employee A (Regular Work owner)', 'executionHub/regularWork', `atomically set ${status} and immutable activity`, update(ref(a, 'executionHub/regularWork'), relativeUpdates));
+    const statusReadBack = (await get(ref(a, ownerTaskPath))).val();
+    const activityReadBack = (await get(ref(a, `executionHub/regularWork/activity/rw-a/${eventId}`))).val();
+    assert.equal(statusReadBack.status, status);
+    assert.equal(activityReadBack.id, eventId);
+    if (status === 'Completed') {
+      assert.equal(statusReadBack.completedAt, `2026-10-03T11:00:0${index}.000Z`);
+      assert.equal(statusReadBack.completedByUid, uidA);
+    }
+    if (status === 'Working' && transition.previousStatus === 'Completed') {
+      assert.equal(statusReadBack.completedAt ?? null, null);
+      assert.equal(statusReadBack.completedByUid ?? null, null);
+    }
+    ownerTaskRecord = statusReadBack;
   }
   const ownerTaskReadBack = (await get(ref(a, ownerTaskPath))).val();
-  assert.equal(ownerTaskReadBack.status, 'Completed');
-  assert.equal(ownerTaskReadBack.completedByUid, uidA);
-  assert.equal(ownerTaskReadBack.completedAt, '2026-10-03T11:00:04.000Z');
-  const reopenedActivityReadBack = (await get(ref(a, 'executionHub/regularWork/activity/rw-a/status-rwa-3'))).val();
-  const completedActivityReadBack = (await get(ref(a, 'executionHub/regularWork/activity/rw-a/status-rwa-4'))).val();
-  assert.equal(reopenedActivityReadBack.text, `${appA} reopened this task`);
+  assert.equal(ownerTaskReadBack.status, 'Discarded');
+  assert.equal(ownerTaskReadBack.discardedByUid, uidA);
+  assert.equal(ownerTaskReadBack.discardedAt, '2026-10-03T11:00:07.000Z');
+  assert.equal(ownerTaskReadBack.completedAt ?? null, null);
+  const completedReadBack=(await get(ref(a, ownerTaskPath))).val();
+  assert.equal(completedReadBack.discardedAt, '2026-10-03T11:00:07.000Z');
+  const completedActivityReadBack = (await get(ref(a, 'executionHub/regularWork/activity/rw-a/status-rwa-5'))).val();
+  const reopenedActivityReadBack = (await get(ref(a, 'executionHub/regularWork/activity/rw-a/status-rwa-6'))).val();
   assert.equal(completedActivityReadBack.text, `${appA} completed this task`);
-  record('Employee A (Regular Work owner)', ownerTaskPath, 'completion/reopen/final completion read-back', 'Completed + metadata', `${ownerTaskReadBack.status} + metadata`);
+  assert.equal(reopenedActivityReadBack.text, `${appA} reopened this task`);
+  record('Employee A (Regular Work owner)', ownerTaskPath, 'full seven-state completion/reopen/discard read-back', 'Discarded + metadata', `${ownerTaskReadBack.status} + metadata`);
 
   const assignedTaskPath = 'executionHub/regularWork/tasks/rw-assigned-b';
   const assignedTaskRecord = (await get(ref(b, assignedTaskPath))).val();
@@ -616,6 +643,7 @@ async function runMatrix() {
   assert.equal((await get(ref(b, assignedTaskPath))).val().completedByUid, uidB);
   const unrelatedTaskRecord = (await env.withSecurityRulesDisabled(async context => (await get(ref(context.database(), 'executionHub/regularWork/tasks/rw-b'))).val()));
   await expectDenied('Employee A (unrelated Regular Work task)', 'executionHub/regularWork/tasks/rw-b', 'complete unrelated parent task', set(ref(a, 'executionHub/regularWork/tasks/rw-b'), { ...unrelatedTaskRecord, status: 'Completed', completedAt: '2026-10-03T11:20:00.000Z', completedByUid: uidA }));
+  await expectDenied('Employee A (unrelated Regular Work task)', 'executionHub/regularWork/tasks/rw-b', 'discard unrelated parent task', set(ref(a, 'executionHub/regularWork/tasks/rw-b'), { ...unrelatedTaskRecord, status: 'Discarded', discardedAt: '2026-10-03T11:21:00.000Z', discardedByUid: uidA }));
   await expectDenied('Employee A (unrelated Regular Work task)', 'executionHub/regularWork/activity/rw-b/status-unrelated-complete', 'write unrelated completion activity', set(ref(a, 'executionHub/regularWork/activity/rw-b/status-unrelated-complete'), {
     id: 'status-unrelated-complete', task: 'rw-b', user: appA, time: '2026-10-03T11:20:00.000Z', type: 'Status', text: `${appA} completed this task`,
     authorUid: uidA, actorUid: uidA, createdByUid: uidA, contextType: 'regular_work'

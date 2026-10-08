@@ -4,7 +4,7 @@
   if (root) root.DailyWorkModel = model;
 })(typeof globalThis === 'undefined' ? this : globalThis, function () {
   const identityFields = ['id', 'appUserId', 'authUid', 'uid', 'firebaseUid', 'employeeId'];
-  const terminalStatuses = new Set(['completed', 'cancelled', 'canceled', 'archived']);
+  const terminalStatuses = new Set(['completed', 'cancelled', 'canceled', 'archived', 'discarded']);
 
   function identityValues(value) {
     if (value == null) return [];
@@ -27,7 +27,7 @@
   }
 
   function normalizeDailyTask(parent, record, employees = []) {
-    if (!parent || !record || record.archived === true || String(record.status || '').toLowerCase() === 'archived') return null;
+    if (!parent || !record || parent.deleted === true || parent.archived === true || record.deleted === true || record.archived === true || String(record.status || '').toLowerCase() === 'archived') return null;
     const employee = resolveEmployee(record.assignedTo, employees);
     const sourceId = String(record.id || '');
     const parentTaskId = String(parent.id || record.parentTaskId || '');
@@ -54,6 +54,7 @@
       sourceDetail: 'Daily Task',
       cancelledAt: record.cancelledAt || '',
       archived: false,
+      deleted: false,
       record,
       parentTask: parent,
       waitingOn: record.waitingOn || ''
@@ -92,20 +93,19 @@
     return !!date && date >= range.start && date <= range.end;
   }
   function isTerminal(item) {
-    return item.archived === true || terminalStatuses.has(String(item.status || '').toLowerCase());
+    return item.deleted === true || item.archived === true || terminalStatuses.has(String(item.status || '').toLowerCase());
   }
   function isOpen(item) { return !isTerminal(item); }
 
   function getWorkMetrics(items, range, today) {
     const work = uniqueWorkItems(items);
-    const due = work.filter(item => inWindow(item.dueDate, range) && !['cancelled', 'canceled', 'archived'].includes(String(item.status || '').toLowerCase()));
-    const completed = work.filter(item => String(item.status || '').toLowerCase() === 'completed' && inWindow(item.completedAt, range));
-    const pending = work.filter(item => isOpen(item) && item.dueDate && dateOf(item.dueDate) <= range.end);
-    const overdue = work.filter(item => isOpen(item) && item.status !== 'Ready for Review' && item.dueDate && dateOf(item.dueDate) < today);
+    const due = work.filter(item => isOpen(item) && inWindow(item.dueDate, range));
+    const completed = work.filter(item => item.deleted !== true && String(item.status || '').toLowerCase() === 'completed' && inWindow(item.completedAt, range));
+    const pending = work.filter(item => isOpen(item) && inWindow(item.dueDate, range));
+    const overdue = work.filter(item => isOpen(item) && item.dueDate && dateOf(item.dueDate) < today);
     const active = work.filter(isOpen);
-    const table = work.filter(item => (isOpen(item) && item.dueDate && dateOf(item.dueDate) <= range.end)
-      || (isOpen(item) && !item.dueDate && (inWindow(item.createdAt, range) || inWindow(item.assignedAt, range)))
-      || (String(item.status || '').toLowerCase() === 'completed' && inWindow(item.completedAt, range)));
+    const table = work.filter(item => (isOpen(item) && inWindow(item.dueDate, range))
+      || (item.deleted !== true && String(item.status || '').toLowerCase() === 'completed' && inWindow(item.completedAt, range)));
     const created = work.filter(item => inWindow(item.createdAt, range) || inWindow(item.assignedAt, range));
     const upcoming = work.filter(item => isOpen(item) && item.dueDate && dateOf(item.dueDate) > today);
     return { work, due, completed, pending, overdue, active, table, created, upcoming };

@@ -9,6 +9,8 @@ const hosting = JSON.parse(fs.readFileSync(new URL('./firebase.json', import.met
 const authSource = fs.readFileSync(new URL('./firebase-bootstrap.js', import.meta.url), 'utf8');
 const phase13Source = fs.readFileSync(new URL('./phase13.js', import.meta.url), 'utf8');
 const phase19Source = fs.readFileSync(new URL('./phase19.js', import.meta.url), 'utf8');
+const phase20Source = fs.readFileSync(new URL('./phase20.js', import.meta.url), 'utf8');
+const taskStatusSource = fs.readFileSync(new URL('./regular-work-task-status.js', import.meta.url), 'utf8');
 const employeeFormSource = fs.readFileSync(new URL('./phase18.js', import.meta.url), 'utf8');
 const appSource = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const { escapeHtml } = require('./xss-safety.js');
@@ -192,4 +194,96 @@ test('Regular Work structural edits use only targeted record saves', () => {
   assert.ok(authSource.includes('Folder read-back failed'));
   assert.ok(authSource.includes('Category read-back failed'));
   assert.ok(authSource.includes('Task read-back failed'));
+});
+
+test('project assignment atomically maintains employee project access indexes', () => {
+  const projectSave = authSource.slice(authSource.indexOf('async saveProjectWithAccess'), authSource.indexOf('async saveRegularWorkComment'));
+  assert.ok(projectSave.includes('sharedProjectsPath'));
+  assert.ok(projectSave.includes('userViewsPath'));
+  assert.ok(projectSave.includes('projectAccess'));
+  assert.ok(projectSave.includes('nextMembers.has(appUserId) ? true : null'));
+  assert.ok(projectSave.includes('Project access read-back failed'));
+  assert.ok(phase13Source.includes('saveProjectWithAccess(record,null,state.users)'));
+  assert.ok(phase13Source.includes('saveProjectWithAccess(updated,before,state.users)'));
+  assert.ok(projectSave.includes('appUserIdByAuthUid'));
+  assert.ok(projectSave.includes('canonicalProject'));
+  assert.ok(phase13Source.includes("toast(error?.message||'Project assignment could not be completed.')"));
+});
+
+test('employee project hydration reads grants and canonical project records by ID', () => {
+  assert.ok(authSource.includes("console.info('[PROJECT ACCESS] uid:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT ACCESS] appUserId:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT ACCESS] grants:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT ACCESS] projectIds:'"));
+  assert.ok(authSource.includes("console.warn('NO PROJECT ACCESS GRANTS FOUND')"));
+  assert.ok(authSource.includes('async function readEmployeeProjectRecords(projectIds)'));
+  assert.ok(authSource.includes("console.info('[PROJECT LOAD] projectId:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT LOAD] found:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT LOAD] projectLead:'"));
+  assert.ok(authSource.includes("console.info('[PROJECT LOAD] team:'"));
+  assert.ok(authSource.includes('? [{ ...snapshot.val(), id: snapshot.val()?.id || ids[index] }]'));
+});
+
+test('project access has no manual sync or backfill UI', () => {
+  assert.doesNotMatch(phase13Source, /syncProjectAccessBtn|syncProjectAccess|backfillProjectAccess/);
+  assert.doesNotMatch(authSource, /async backfillProjectAccess/);
+});
+
+test('Regular Work hierarchy uses targeted records and stable relationship IDs', () => {
+  for (const symbol of ['saveRegularWorkFolder', 'saveRegularWorkCategory', 'saveRegularWorkTask']) assert.ok(phase19Source.includes(symbol));
+  assert.ok(phase13Source.includes('createRegularWorkTask'));
+  assert.ok(phase13Source.includes('folderId:folder.id,categoryId:category.id,regularFolderId:folder.id,regularCategoryId:category.id'));
+  assert.doesNotMatch(phase19Source, /save\(\)|saveRegularWorkState|saveRegularWorkDailyTask|Daily Tasks/);
+  assert.ok(phase19Source.includes("['Pending','In Progress','Completed']"));
+  assert.ok(taskStatusSource.includes("['Pending', 'In Progress', 'Working', 'On Hold', 'Ready for Review', 'Completed', 'Discarded']"));
+  assert.ok(authSource.includes('Folder read-back failed'));
+  assert.ok(authSource.includes('Category read-back failed'));
+  assert.ok(authSource.includes('Task read-back failed'));
+});
+
+test('Daily Tasks history is dormant and excluded from active drawer/dashboard', () => {
+  assert.doesNotMatch(phase19Source, /dailyTask|Daily Tasks|Add Daily Task|rw-daily/);
+  assert.doesNotMatch(phase20Source, /normalizeDailyTask|dailyCache|dailyParents|watchRegularWorkDailyTasks|kind==='daily'/);
+  assert.doesNotMatch(authSource, /getRegularWorkDailyTasks|saveRegularWorkDailyTask|watchRegularWorkDailyTasks/);
+  assert.doesNotMatch(authSource, /onValue\(ref\(database, regularWorkPath\)/);
+  assert.ok(authSource.includes('get(ref(database, `${regularWorkDailyTasksPath}/${taskId}`))'), 'task deletion checks legacy child history before deciding to soft-delete');
+});
+
+test('Regular Work drawer preserves Task Details, actions, comments, and activity order', () => {
+  const drawer = phase19Source.slice(phase19Source.indexOf('const baseOpenTaskDrawer=openTask'), phase19Source.indexOf("el('closeDrawer').addEventListener"));
+  assert.ok(drawer.includes('<h4>Task Details</h4>'));
+  assert.ok(drawer.includes('Schedule on Planner'));
+  assert.ok(drawer.includes('Send for Approval'));
+  assert.ok(drawer.includes('Update Status'));
+  assert.ok(drawer.includes("heading.textContent='Comments'"));
+  assert.ok(drawer.includes("heading.textContent='Activity'"));
+});
+
+test('Regular Work status writes target the existing task and atomically persist Activity', () => {
+  assert.ok(phase13Source.includes('saveRegularWorkTaskStatus(t.id'));
+  assert.ok(authSource.includes('async saveRegularWorkTaskStatus(taskId, patch, activity)'));
+  assert.ok(authSource.includes('tasks/${taskKey}/${field}'));
+  assert.ok(authSource.includes('activity/${taskKey}/${databaseRecordKey(activityId)}'));
+  assert.ok(authSource.includes('Regular Work task status read-back failed'));
+  assert.ok(authSource.includes('Regular Work status activity read-back failed'));
+  assert.ok(authSource.includes("'discardedAt', 'discardedByUid'"));
+});
+
+test('Regular Work drawer renders one clickable seven-status menu', () => {
+  const drawer = phase19Source.slice(phase19Source.indexOf('const baseOpenTaskDrawer=openTask'), phase19Source.indexOf("el('closeDrawer').addEventListener"));
+  assert.ok(drawer.includes("updateToggle.textContent='Update Status'"));
+  assert.ok(drawer.includes('window.regularWorkTaskStatus?.statusOptions'));
+  assert.doesNotMatch(drawer, /\bregularTaskStatus\b/);
+  assert.ok(drawer.includes('updateMenu.hidden=true'));
+  assert.ok(drawer.includes("updateMenu.innerHTML=statusOptions.map(status=>`<button type=\"button\""));
+  assert.ok(drawer.includes('await updateStatus(id,button.dataset.status)'));
+  for (const status of ['Pending', 'In Progress', 'Working', 'On Hold', 'Ready for Review', 'Completed', 'Discarded']) assert.ok(taskStatusSource.includes(`'${status}'`));
+  assert.doesNotMatch(drawer, /Start \/ Resume|data-status="Ready for Review"/);
+});
+
+test('Regular Work dashboard maps On Hold and Discarded out of Active Load', () => {
+  assert.ok(phase20Source.includes("item.status==='On Hold'||item.waitingOn"));
+  assert.ok(phase20Source.includes("['Cancelled','Canceled','Discarded']"));
+  assert.ok(phase20Source.includes("'discarded'].includes(String(item.status||'').toLowerCase())"));
+  assert.ok(phase20Source.includes("['On Hold','Waiting','Blocked'].includes(status)"));
 });

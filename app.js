@@ -83,12 +83,14 @@ const fmtDate = d => new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'2-
 const fmtDateFull = d => new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
 const fmtTime = d => new Date(d).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
 const daysDiff = d => Math.ceil((new Date(d+'T23:59:59')-today)/86400000);
-const isOverdue = t => !['Completed','Ready for Review'].includes(t.status) && daysDiff(t.currentDue) < 0;
+const isOverdue = t => !['Completed','Ready for Review','Discarded'].includes(t.status) && daysDiff(t.currentDue) < 0;
 const healthLabel = h => ({'on-track':'On Track','at-risk':'At Risk','delayed':'Delayed'})[h] || h;
 const avatar = uid => `<div class="avatar">${escapeHtml(user(uid).initials)}</div>`;
 const person = uid => `<div class="person">${avatar(uid)}<div><strong>${escapeHtml(user(uid).name)}</strong><div class="subtle">${escapeHtml(user(uid).role)}</div></div></div>`;
 const statusClass = s => {
   if(s==='Ready for Review'||s==='Changes Required') return 'review';
+  if(s==='On Hold') return 'waiting';
+  if(s==='Discarded') return 'archived';
   if(s==='Waiting'||s==='Blocked') return 'waiting';
   if(s==='Completed') return 'completed';
   if(s==='Overdue') return 'overdue';

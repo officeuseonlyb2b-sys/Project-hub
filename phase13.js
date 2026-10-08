@@ -6,6 +6,7 @@
   const commentHelpers=window.regularWorkCommentHelpers;
   const regularTaskStatus=window.regularWorkTaskStatus;
   const regularWorkCommentSaving=commentHelpers?.createTaskScopedSubmitGuard();
+  const regularWorkStatusSaving=new Set();
   commentHelpers?.installRegularWorkCommentClickDelegation(document,taskId=>addComment(taskId));
 
   const escapeHtml=window.executionHubEscapeHtml||function(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))};
@@ -27,8 +28,7 @@
     state.projects.forEach(p=>{
       if(!p.lifecycle)p.lifecycle='Active';
       p.projectLead=p.projectLead||p.owner||directorId;
-      if(!Array.isArray(p.team)||!p.team.length)p.team=[p.projectLead].filter(Boolean);
-      if(state.users.some(u=>u.id===directorId)&&!p.team.includes(directorId))p.team.unshift(directorId);
+      if(!Array.isArray(p.team))p.team=[];
       if(p.projectLead&&!p.team.includes(p.projectLead))p.team.push(p.projectLead);
       if(Object.hasOwn(p,'workstreams')&&Array.isArray(p.workstreams)){
         p.workstreams=projectWorkstreams(p).map(w=>typeof w==='string'?{name:w,progress:0,owner:p.projectLead}:{...w,owner:w.owner||p.projectLead});
@@ -53,7 +53,7 @@
   function canCreateTask(p,ws,uid=state.currentUser){return canViewProject(p,uid) && (!!ws && projectWorkstreams(p).some(w=>w.name===ws))}
   function canAssignTaskToOthers(p,ws,uid=state.currentUser){return canManageProject(p,uid)||isCategoryOwner(p,ws,uid)}
   function canRegularWorkTask(t){return t?.contextType==='regular_work'&&!!window.firebaseHub?.canAccessRegularWorkTask(t.id)}
-  function canEditTask(t,uid=state.currentUser){if(t?.contextType==='regular_work')return canRegularWorkTask(t)&&(isDirector(uid)||t.owner===uid||t.createdBy===uid||t.reviewer===uid);const p=project(t.project);return !!p&&canViewProject(p,uid)&&(isDirector(uid)||isProjectLead(p,uid)||isCategoryOwner(p,t.workstream,uid)||t.owner===uid)}
+  function canEditTask(t,uid=state.currentUser){if(t?.contextType==='regular_work')return canRegularWorkTask(t)&&(isDirector(uid)||t.owner===uid||t.createdBy===uid||t.createdByUid===window.firebaseHub?.firebaseUid||t.folderOwnerUid===window.firebaseHub?.firebaseUid);const p=project(t.project);return !!p&&canViewProject(p,uid)&&(isDirector(uid)||isProjectLead(p,uid)||isCategoryOwner(p,t.workstream,uid)||t.owner===uid)}
   function canCommentTask(t,uid=state.currentUser){if(t?.contextType==='regular_work')return canRegularWorkTask(t);const p=project(t.project);return !!p&&canViewProject(p,uid)}
   function canApproveTask(t,uid=state.currentUser){if(t?.contextType==='regular_work')return canRegularWorkTask(t)&&(isDirector(uid)||(state.approvals||[]).some(a=>a.task===t.id&&((a.approvers||[]).includes(uid)||a.requestedBy===uid)));const p=project(t.project);return !!p&&canViewProject(p,uid)&&(isDirector(uid)||isProjectLead(p,uid)||isCategoryOwner(p,t.workstream,uid))&&t.owner!==uid}
   function lifeClass(v){return ({Active:'on-track',Planning:'review','On Hold':'waiting',Terminated:'overdue',Launched:'completed',Archived:'archived'})[v]||'on-track'}
@@ -87,7 +87,7 @@
       ${field('Project Lead',`<select class="select" name="lead">${activeUserOptions(state.currentUser)}</select>`,'Project Lead gets management authority only inside this project.')}
       ${field('Description','<textarea class="textarea" name="description" placeholder="What are we launching and what does success mean?"></textarea>')}
       ${field('Starting categories','<input class="input" name="workstreams" placeholder="Category 1, Category 2, Category 3">','Separate categories with commas. More can be added later.')}
-      <div><div class="form-label">Initial project team</div><div class="form-help">Only selected active employees can access this project. Director and the selected Project Lead are always included.</div>${teamChecks([directorId,state.currentUser],[directorId])}</div>
+      <div><div class="form-label">Initial project team</div><div class="form-help">Only selected active employees can access this project. The selected Project Lead is included automatically.</div>${teamChecks([],[])}</div>
       <div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft" type="submit">Create Project</button></div>
     </form>`);
     el('cancelModal').onclick=closeModal;
@@ -102,7 +102,7 @@
 
   function openManageProjectTeam(p){
     if(!canManageProject(p))return toast('Only the Director or this Project Lead can manage project access.');
-    const locked=[directorId,p.projectLead];
+    const locked=[p.projectLead];
     openModal(`Manage Team • ${p.name}`,`<form id="manageTeamForm" class="form-stack"><div class="form-help prominent">Select from active employee accounts. Director and Project Lead are locked into access. Removing someone from a project never deletes their historic tasks, comments or audit activity.</div>${teamChecks(p.team||[],locked)}<div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft" type="submit">Save Project Team</button></div></form>`);
     el('cancelModal').onclick=closeModal;
     el('manageTeamForm').onsubmit=e=>{
@@ -120,6 +120,40 @@
     el('leadForm').onsubmit=e=>{e.preventDefault();const next=new FormData(e.target).get('lead'),old=p.projectLead;if(next===old)return closeModal();p.projectLead=next;if(!p.team.includes(next))p.team.push(next);log(state.currentUser,p.id,null,'Leadership',`changed Project Lead`,`${user(old).name} → ${user(next).name}`);save();closeModal();render();toast(`${user(next).name} is now Project Lead.`)};
   }
 
+  const baseOpenNewProject=openNewProject;
+  openNewProject=function(){
+    baseOpenNewProject();
+    const form=el('newProjectForm');if(!form)return;
+    form.onsubmit=async event=>{
+      event.preventDefault();const submit=form.querySelector('[type="submit"]'),fd=new FormData(form),id='p'+Date.now(),lead=String(fd.get('lead')||'');
+      const team=[...form.querySelectorAll('input[name=team]:checked')].map(input=>input.value);team.push(lead);
+      const names=String(fd.get('workstreams')||'').split(',').map(value=>value.trim()).filter(Boolean);
+      const record={id,category:fd.get('category'),name:String(fd.get('name')||'').trim(),code:String(fd.get('code')||'').trim().toUpperCase(),owner:state.currentUser,projectLead:lead,launch:fd.get('launch'),health:'on-track',progress:0,description:String(fd.get('description')||'').trim(),lifecycle:'Planning',team:[...new Set(team)],workstreams:names.map(name=>({name,progress:0,owner:lead})),createdBy:state.currentUser,createdAt:new Date().toISOString()};
+      if(submit)submit.disabled=true;
+      try{const saved=await window.firebaseHub.saveProjectWithAccess(record,null,state.users);state.projects.unshift(saved);closeModal();activeProject=id;activeProjectTab='overview';render();toast('Project created with project-specific leadership and access.')}catch(error){console.error('Could not create project assignment:',error);toast(error?.message||'Project assignment could not be completed.')}finally{if(submit)submit.disabled=false}
+    };
+  };
+  const baseOpenManageProjectTeam=openManageProjectTeam;
+  openManageProjectTeam=function(projectRecord){
+    if(!isDirector())return toast('Only the System Admin can change project membership.');
+    baseOpenManageProjectTeam(projectRecord);
+    const form=el('manageTeamForm');if(!form)return;
+    form.onsubmit=async event=>{
+      event.preventDefault();const submit=form.querySelector('[type="submit"]'),before={...projectRecord,team:[...(projectRecord.team||[])]},team=[...form.querySelectorAll('input[name=team]:checked')].map(input=>input.value),updated={...projectRecord,team:[...new Set([...team,projectRecord.projectLead])]};
+      if(submit)submit.disabled=true;
+      try{const saved=await window.firebaseHub.saveProjectWithAccess(updated,before,state.users);Object.assign(projectRecord,saved);closeModal();render();toast('Project team access updated.')}catch(error){console.error('Could not update project assignment:',error);toast(error?.message||'Project assignment could not be completed.')}finally{if(submit)submit.disabled=false}
+    };
+  };
+  const baseOpenChangeProjectLead=openChangeProjectLead;
+  openChangeProjectLead=function(projectRecord){
+    baseOpenChangeProjectLead(projectRecord);
+    const form=el('leadForm');if(!form)return;
+    form.onsubmit=async event=>{
+      event.preventDefault();const submit=form.querySelector('[type="submit"]'),next=String(new FormData(form).get('lead')||''),before={...projectRecord,team:[...(projectRecord.team||[])]};if(!next||next===before.projectLead)return closeModal();const updated={...projectRecord,projectLead:next,team:[...new Set([...(projectRecord.team||[]),next])]};
+      if(submit)submit.disabled=true;
+      try{const saved=await window.firebaseHub.saveProjectWithAccess(updated,before,state.users);Object.assign(projectRecord,saved);closeModal();render();toast(`${user(next).name} is now Project Lead.`)}catch(error){console.error('Could not update project lead:',error);toast(error?.message||'Project assignment could not be completed.')}finally{if(submit)submit.disabled=false}
+    };
+  };
   function openAddWorkstream(p){
     if(!canManageProject(p))return toast('Only Director or Project Lead can add project categories.');
     openModal(`Add Category • ${p.name}`,`<form id="addWsForm" class="form-stack"><div class="form-grid">${field('Category / workstream','<input class="input" name="name" required placeholder="Category name">')}${field('Category owner',`<select class="select" name="owner">${(p.team||[]).filter(isActiveUser).map(uid=>`<option value="${escapeHtml(uid)}">${escapeHtml(user(uid).name)}</option>`).join('')}</select>`,'Category owner can assign and manage tasks within this category.')}</div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft">Add Category</button></div></form>`);
@@ -138,7 +172,7 @@
     const regular=!!regularContext;
     const folder=regularContext?.folder,category=regularContext?.category;
     if(regular){
-      if(!folder||!category||folder.status==='archived'||category.status==='archived'||(!isDirector()&&folder.ownerUid!==window.firebaseHub?.firebaseUid))return toast('Only the Folder owner can create Regular Work tasks here.');
+      if(!folder||!category||folder.status==='archived'||category.archived===true||category.status==='archived'||(!isDirector()&&folder.ownerUid!==window.firebaseHub?.firebaseUid))return toast('Only the Folder owner can create Regular Work tasks here.');
     }else if(!canViewProject(p))return toast('You do not have access to this project.');
     const allowed=regular?[category]:projectWorkstreams(p).filter(w=>canCreateTask(p,w.name));if(!allowed.length)return toast(regular?'This Regular Work folder has no active categories.':'This project has no categories yet.');
     const current=regular?category.name:(allowed.some(w=>w.name===preWs)?preWs:allowed[0].name);
@@ -151,12 +185,19 @@
       : `<select class="select" name="workstream" id="taskWsSelect">${allowed.map(w=>`<option value="${escapeHtml(w.name)}" ${w.name===current?'selected':''}>${escapeHtml(w.name)}</option>`).join('')}</select>`;
     openModal(regular?`New Regular Work Task • ${folder.name}`:`New Task • ${p.name}`,`<form id="newTaskForm" class="form-stack"><div class="form-grid">${field('Category',categoryField)}${field('Task owner',ownerField)}${field('Priority','<select class="select" name="priority"><option>P1</option><option>P0</option><option>P2</option><option>P3</option></select>')}${field('Due date','<input class="input" name="due" type="date" required>')}</div>${regularFields}${field('Task title','<input class="input" name="title" required placeholder="Clear, deliverable action">')}${field('Deliverable / grouping','<input class="input" name="deliverable" placeholder="e.g. Homepage, Logo, Hotel Contracting">')}${field('Next action','<input class="input" name="next" placeholder="What happens next?">')}<div class="modal-actions"><button type="button" class="btn btn-ghost" id="cancelModal">Cancel</button><button class="btn btn-soft">Create Task</button></div></form>`);
     el('cancelModal').onclick=closeModal;
-    el('newTaskForm').onsubmit=e=>{
+    el('newTaskForm').onsubmit=async e=>{
       e.preventDefault();const fd=new FormData(e.target),ws=fd.get('workstream'),owner=canAssign?fd.get('owner'):state.currentUser;
       if(regular){
         const id=`rwt${Date.now()}${Math.floor(Math.random()*10000)}`,now=new Date().toISOString();
-        const t={id,contextType:'regular_work',regularFolderId:folder.id,regularCategoryId:category.id,regularFolderName:folder.name,regularCategoryName:category.name,folderOwnerUid:folder.ownerUid,folderOwnerUserId:folder.ownerUserId,createdByUid:window.firebaseHub.firebaseUid,createdBy:state.currentUser,project:null,workstream:ws,deliverable:String(fd.get('deliverable')||'General'),title:String(fd.get('title')||'').trim(),description:String(fd.get('description')||'').trim(),owner,priority:fd.get('priority'),status:'Not Started',progress:0,startDate:fd.get('startDate')||null,originalDue:fd.get('due'),currentDue:fd.get('due'),waitingOn:null,next:fd.get('next')||'Start task',reviewer:folder.ownerUserId||state.currentUser,createdAt:now};
-        state.tasks.push(t);log(state.currentUser,null,id,'Task',`created Regular Work task ${t.title}`,`${folder.name} • ${category.name} • Assigned to: ${user(owner).name}`);save();closeModal();render();toast('Regular Work task created and recorded.');return;
+        const t={id,contextType:'regular_work',folderId:folder.id,categoryId:category.id,regularFolderId:folder.id,regularCategoryId:category.id,regularFolderName:folder.name,regularCategoryName:category.name,folderOwnerUid:folder.ownerUid,folderOwnerUserId:folder.ownerUserId,createdByUid:window.firebaseHub.firebaseUid,createdBy:state.currentUser,project:null,workstream:ws,deliverable:String(fd.get('deliverable')||'General'),title:String(fd.get('title')||'').trim(),description:String(fd.get('description')||'').trim(),owner,priority:fd.get('priority'),status:'Pending',progress:0,startDate:fd.get('startDate')||null,originalDue:fd.get('due'),currentDue:fd.get('due'),waitingOn:null,next:fd.get('next')||'Start task',reviewer:folder.ownerUserId||state.currentUser,createdAt:now};
+        const submit=e.currentTarget.querySelector('[type="submit"]');if(submit)submit.disabled=true;
+        try{
+          const saved=await window.firebaseHub.createRegularWorkTask(t);
+          state.tasks.push(saved);log(state.currentUser,null,id,'Task',`created Regular Work task ${t.title}`,`${folder.name} • ${category.name} • Assigned to: ${user(owner).name}`);
+          const activity=state.activity?.[0];if(activity)try{await window.firebaseHub.saveRegularWorkActivity(activity)}catch(error){console.error('Task was created but its activity record could not be saved:',error)}
+          closeModal();render();toast('Regular Work task created and recorded.');
+        }catch(error){console.error('Could not create Regular Work task:',error);toast(error?.message||'Regular Work task could not be created.');if(submit)submit.disabled=false}
+        return;
       }
       const projectOwner=canAssignTaskToOthers(p,ws)?fd.get('owner'):state.currentUser,id='t'+Date.now(),t={id,project:p.id,workstream:ws,deliverable:fd.get('deliverable')||'General',title:fd.get('title').trim(),owner:projectOwner,priority:fd.get('priority'),status:'Not Started',progress:0,originalDue:fd.get('due'),currentDue:fd.get('due'),waitingOn:null,next:fd.get('next')||'Start task',reviewer:wsOwner(p,ws)||p.projectLead};state.tasks.push(t);log(state.currentUser,p.id,id,'Task',`created task ${t.title}`,`Owner: ${user(t.owner).name} • Due: ${fmtDateFull(t.currentDue)}`);save();closeModal();activeProjectTab='tasks';render();toast('Task created and recorded.');
     };
@@ -251,8 +292,9 @@
     if(t.contextType!=='regular_work')return projectTaskDrawer13(id);
     if(!canRegularWorkTask(t))return toast('You do not have access to this Regular Work task.');
     const comments=state.comments.filter(comment=>comment.task===id),history=state.activity.filter(event=>event.task===id),editable=canEditTask(t),commentable=canCommentTask(t);
-    const statusChoices=[...new Set([...(regularTaskStatus?.statusOptions||['Not Started','In Progress','Ready for Review','Completed']),t.status||'Not Started'])].filter(status=>status!==(t.status||'Not Started'));
-    const statusButtons=statusChoices.map(status=>{const label=status==='Completed'?'✓ Mark as Completed':t.status==='Completed'&&status==='In Progress'?'↻ Reopen / In Progress':status;return `<button type="button" class="btn ${status==='Completed'?'btn-soft':'btn-ghost'} status-update" data-task="${escapeHtml(id)}" data-status="${escapeHtml(status)}">${escapeHtml(label)}</button>`}).join('');
+    const currentStatus=t.status||'Pending';
+    const statusChoices=(regularTaskStatus?.statusOptions||['Pending','In Progress','Working','On Hold','Ready for Review','Completed','Discarded']).filter(status=>status!==currentStatus);
+    const statusButtons=statusChoices.map(status=>{const label=status==='Completed'?'✓ Mark as Completed':status==='Discarded'?'× Discard Task':currentStatus==='Completed'&&['Pending','In Progress','Working','On Hold'].includes(status)?`↻ Reopen / ${status}`:status;return `<button type="button" class="btn ${status==='Completed'?'btn-soft':'btn-ghost'} status-update" data-task="${escapeHtml(id)}" data-status="${escapeHtml(status)}">${escapeHtml(label)}</button>`}).join('');
     const authority=isDirector()?'System Admin':t.owner===state.currentUser?'Assignee':t.createdBy===state.currentUser?'Task Creator':'Task Collaborator';
     el('drawerEyebrow').textContent=`REGULAR WORK • ${String(t.regularFolderName||'Folder').toUpperCase()} • ${String(t.regularCategoryName||t.workstream||'CATEGORY').toUpperCase()}`;
     el('drawerTitle').textContent=t.title;
@@ -260,43 +302,40 @@
     const canReassign=!!window.firebaseHub?.isSystemAdmin?.()||t.createdBy===state.currentUser||t.folderOwnerUserId===window.firebaseHub?.firebaseUid;
     if(canReassign){const updateSection=[...el('drawerBody').querySelectorAll('.drawer-section')].find(section=>section.querySelector('h4')?.textContent==='Update work');if(updateSection)updateSection.insertAdjacentHTML('beforeend',`<div class="regular-reassign-row"><label class="form-field"><span>Reassign to</span><select class="select" id="regularTaskAssignee">${state.users.filter(account=>account.active!==false).map(account=>`<option value="${escapeHtml(account.id)}" ${account.id===t.owner?'selected':''}>${escapeHtml(account.name)}</option>`).join('')}</select></label><button type="button" class="btn btn-ghost" id="saveRegularTaskAssignee">Save Assignment</button></div>`)}
     el('taskDrawer').classList.add('open');el('drawerBackdrop').classList.add('open');wireDrawer(id);
-    const reassign=el('saveRegularTaskAssignee');if(reassign)reassign.onclick=async()=>{const next=el('regularTaskAssignee')?.value;if(!next||next===t.owner)return;const old=t.owner;t.owner=next;log(state.currentUser,null,t.id,'Assignment',`reassigned Regular Work task ${t.title}`,`${user(old).name} → ${user(next).name}`);await save();openTask(id);render();toast(`Task reassigned to ${user(next).name}.`)};
+    const reassign=el('saveRegularTaskAssignee');if(reassign)reassign.onclick=async()=>{const next=el('regularTaskAssignee')?.value;if(!next||next===t.owner)return;const old=t.owner,now=new Date().toISOString();reassign.disabled=true;try{const saved=await window.firebaseHub.saveRegularWorkTask(t.id,{owner:next,updatedAt:now,updatedByUid:window.firebaseHub?.firebaseUid||''});Object.assign(t,saved);const priorActivityIds=new Set(state.activity.map(event=>event.id));log(state.currentUser,null,t.id,'Assignment',`reassigned Regular Work task ${t.title}`,`${user(old).name} → ${user(next).name}`);const activity=state.activity.find(event=>!priorActivityIds.has(event.id));if(activity)try{await window.firebaseHub.saveRegularWorkActivity(activity)}catch(error){console.error('Task assignment was saved but its activity record could not be saved:',error)}openTask(id);render();toast(`Task reassigned to ${user(next).name}.`)}catch(error){console.error('Could not reassign Regular Work task:',error);toast(error?.message||'Task assignment could not be saved.')}finally{reassign.disabled=false}};
   };
 
   async function updateRegularWorkTaskStatus(t,newStatus){
     if(!canEditTask(t))return toast('You do not have permission to update this task.');
-    const transition=regularTaskStatus?.createRegularWorkTaskStatusChange(t,newStatus,window.firebaseHub?.firebaseUid,new Date().toISOString());
+    if(regularWorkStatusSaving.has(t.id))return toast('This task status is already being saved.');
+    const changedAt=new Date().toISOString();
+    const transition=regularTaskStatus?.createRegularWorkTaskStatusChange(t,newStatus,window.firebaseHub?.firebaseUid,changedAt);
     if(!transition)return toast('Task is already in that status.');
-    const prior={status:t.status,progress:t.progress,completedAt:t.completedAt,completedByUid:t.completedByUid};
-    const hadStatus=Object.hasOwn(t,'status'),hadProgress=Object.hasOwn(t,'progress'),hadCompletedAt=Object.hasOwn(t,'completedAt'),hadCompletedByUid=Object.hasOwn(t,'completedByUid');
+    const prior={...t},priorKeys=new Set(Object.keys(t));
     Object.assign(t,transition.updates);
-    if(newStatus==='Ready for Review')t.progress=100;
-    let createdApproval=null;
-    if(newStatus==='Ready for Review'&&!state.approvals.some(approval=>approval.task===t.id&&approval.type==='Deliverable Review')){
-      createdApproval={id:'a'+Date.now(),type:'Deliverable Review',task:t.id,requestedBy:state.currentUser,requestedAt:new Date().toISOString(),detail:'Task submitted for review.'};
-      state.approvals.unshift(createdApproval);
-    }
     const priorActivityIds=new Set(state.activity.map(event=>event.id));
     log(state.currentUser,null,t.id,'Status',transition.activityVerb,`${transition.previousStatus} → ${transition.nextStatus}`);
     const statusActivity=state.activity.find(event=>!priorActivityIds.has(event.id));
+    if(statusActivity)statusActivity.id=`h${Date.now()}${Math.random().toString(36).slice(2,8)}`;
+    const controls=[...document.querySelectorAll('.status-update')].filter(button=>button.dataset.task===t.id);
+    controls.forEach(button=>button.disabled=true);regularWorkStatusSaving.add(t.id);
     try{
-      const saved=await save();
-      if(saved===false)throw new Error('Firebase did not confirm saving the Regular Work task status.');
+      if(!statusActivity)throw new Error('Could not create the Regular Work status Activity entry.');
+      const result=await window.firebaseHub.saveRegularWorkTaskStatus(t.id,{...transition.updates,updatedAt:changedAt,updatedByUid:window.firebaseHub?.firebaseUid||''},statusActivity);
+      Object.assign(t,result.task);
+      const activityIndex=state.activity.findIndex(event=>event.id===result.activity.id);
+      if(activityIndex<0)state.activity.unshift(result.activity);else state.activity[activityIndex]=result.activity;
       render();
       openTask(t.id);
-      toast(newStatus==='Completed'?'Task marked Completed.':transition.previousStatus==='Completed'?'Task reopened.':`Status updated to ${newStatus}.`);
+      toast(newStatus==='Completed'?'Task marked Completed.':newStatus==='Discarded'?'Task discarded.':['Completed','Discarded'].includes(transition.previousStatus)?`Task reopened as ${newStatus}.`:`Status updated to ${newStatus}.`);
     }catch(error){
-      if(hadStatus)t.status=prior.status;else delete t.status;
-      if(hadProgress)t.progress=prior.progress;else delete t.progress;
-      if(hadCompletedAt)t.completedAt=prior.completedAt;else delete t.completedAt;
-      if(hadCompletedByUid)t.completedByUid=prior.completedByUid;else delete t.completedByUid;
+      Object.keys(t).forEach(key=>{if(!priorKeys.has(key))delete t[key]});Object.assign(t,prior);
       if(statusActivity)state.activity=state.activity.filter(event=>event.id!==statusActivity.id);
-      if(createdApproval)state.approvals=state.approvals.filter(approval=>approval.id!==createdApproval.id);
       console.error('Could not save Regular Work parent task status:',error);
       render();
       openTask(t.id);
       toast('Task status could not be saved. Please try again.');
-    }
+    }finally{regularWorkStatusSaving.delete(t.id);controls.forEach(button=>button.disabled=false)}
   }
 
   updateStatus=function(id,newStatus){

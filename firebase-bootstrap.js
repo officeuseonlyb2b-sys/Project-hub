@@ -478,11 +478,38 @@ async function readRegularWorkData(firebaseUid, admin, employeeProfile = null) {
   let ownerActivity = {};
   let allowedTaskIds = [];
   if (admin) {
-    const snapshot = await get(ref(database, regularWorkPath));
-    stored = snapshot.exists() ? snapshot.val() : {};
+    const [ownersSnapshot, tasksSnapshot, taskAccessSnapshot, ownerActivitySnapshot] = await Promise.all([
+      get(ref(database, regularWorkOwnersPath)),
+      get(ref(database, regularWorkTasksPath)),
+      get(ref(database, regularWorkTaskAccessPath)),
+      get(ref(database, regularWorkOwnerActivityPath))
+    ]);
+    stored = {
+      owners: ownersSnapshot.exists() ? ownersSnapshot.val() : {},
+      tasks: tasksSnapshot.exists() ? tasksSnapshot.val() : {},
+      taskAccess: taskAccessSnapshot.exists() ? taskAccessSnapshot.val() : {}
+    };
     owners = stored.owners || {};
-    ownerActivity = stored.ownerActivity || {};
+    ownerActivity = ownerActivitySnapshot.exists() ? ownerActivitySnapshot.val() : {};
     allowedTaskIds = Object.keys(stored.tasks || {});
+    const grouped = await Promise.all(allowedTaskIds.map(async taskId => {
+      const [comments, approvals, activity, calendarEvents] = await Promise.all([
+        get(ref(database, `${regularWorkCommentsPath}/${taskId}`)),
+        get(ref(database, `${regularWorkApprovalsPath}/${taskId}`)),
+        get(ref(database, `${regularWorkActivityPath}/${taskId}`)),
+        get(ref(database, `${regularWorkCalendarPath}/${taskId}`))
+      ]);
+      return [taskId, {
+        comments: comments.exists() ? comments.val() : {},
+        approvals: approvals.exists() ? approvals.val() : {},
+        activity: activity.exists() ? activity.val() : {},
+        calendarEvents: calendarEvents.exists() ? calendarEvents.val() : {}
+      }];
+    }));
+    stored.comments = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.comments]));
+    stored.approvals = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.approvals]));
+    stored.activity = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.activity]));
+    stored.calendarEvents = Object.fromEntries(grouped.map(([taskId, data]) => [taskId, data.calendarEvents]));
   } else {
     const [ownerSnapshot, accessSnapshot, ownerActivitySnapshot] = await Promise.all([
       get(ref(database, `${regularWorkOwnersPath}/${firebaseUid}`)),
@@ -518,12 +545,16 @@ async function readRegularWorkData(firebaseUid, admin, employeeProfile = null) {
   const folders = [];
   const categories = [];
   Object.entries(owners).forEach(([ownerUid, data]) => {
-    folders.push(...recordsWithKeys(data?.folders).map(folder => ({ ...folder, ownerUid: folder.ownerUid || ownerUid })));
-    categories.push(...recordsWithKeys(data?.categories).map(category => ({ ...category, ownerUid: category.ownerUid || ownerUid })));
+    folders.push(...recordsWithKeys(data?.folders).filter(folder => folder.deleted !== true).map(folder => ({ ...folder, ownerUid: folder.ownerUid || ownerUid })));
+    categories.push(...recordsWithKeys(data?.categories).filter(category => category.deleted !== true).map(category => ({ ...category, ownerUid: category.ownerUid || ownerUid })));
   });
-  const tasks = recordsWithKeys(stored.tasks).filter(task => allowedTaskIds.includes(task.id)).map(task => ({
+  const tasks = recordsWithKeys(stored.tasks).filter(task => task.deleted !== true && allowedTaskIds.includes(task.id)).map(task => ({
     ...task,
     contextType: 'regular_work',
+    folderId: task.folderId || task.regularFolderId,
+    categoryId: task.categoryId || task.regularCategoryId,
+    regularFolderId: task.regularFolderId || task.folderId,
+    regularCategoryId: task.regularCategoryId || task.categoryId,
     project: null,
     workstream: task.regularCategoryName || task.workstream || 'Regular Work',
     deliverable: task.deliverable || task.regularFolderName || 'Regular Work'
@@ -601,6 +632,11 @@ async function readEmployeeWorkspace(profile) {
   const directory = directorySnapshot?.exists() ? directorySnapshot.val() : { users: [], departments: [] };
 
   const projectIds = Object.keys(userView.projectAccess || {}).filter(id => userView.projectAccess[id] === true);
+  console.info('[PROJECT ACCESS] uid:', uid);
+  console.info('[PROJECT ACCESS] appUserId:', profile?.appUserId || '');
+  console.info('[PROJECT ACCESS] grants:', userView.projectAccess || {});
+  console.info('[PROJECT ACCESS] projectIds:', projectIds);
+  if (!projectIds.length) console.warn('NO PROJECT ACCESS GRANTS FOUND');
   const taskIds = [...new Set([
     ...Object.keys(userView.taskAccess || {}).filter(id => userView.taskAccess[id] === true),
     ...Object.keys(userView.projectTaskAccess || {}).filter(id => userView.projectTaskAccess[id] === true)
@@ -608,7 +644,7 @@ async function readEmployeeWorkspace(profile) {
   const approvalIds = Object.keys(userView.approvalAccess || {}).filter(id => userView.approvalAccess[id] === true);
   const calendarIds = Object.keys(userView.calendarAccess || {}).filter(id => userView.calendarAccess[id] === true);
   const [projects, tasks, approvals, calendarEvents, commentsByTask, activityByTask] = await Promise.all([
-    readScopedRecords(sharedProjectsPath, projectIds),
+    readEmployeeProjectRecords(projectIds),
     readScopedRecords(sharedTasksPath, taskIds),
     readScopedRecords(sharedApprovalsPath, approvalIds),
     readScopedRecords(sharedCalendarPath, calendarIds),
@@ -642,10 +678,23 @@ async function readEmployeeWorkspace(profile) {
   return normalizeWorkspace(state);
 }
 
+async function readEmployeeProjectRecords(projectIds) {
+  const snapshots = await Promise.all(projectIds.map(async projectId => {
+    const snapshot = await get(ref(database, `${sharedProjectsPath}/${databaseRecordKey(projectId)}`));
+    const projectRecord = snapshot.exists() ? snapshot.val() : null;
+    console.info('[PROJECT LOAD] projectId:', projectId);
+    console.info('[PROJECT LOAD] found:', !!projectRecord);
+    console.info('[PROJECT LOAD] projectLead:', projectRecord?.projectLead ?? null);
+    console.info('[PROJECT LOAD] team:', projectRecord?.team ?? null);
+    return { projectId, projectRecord };
+  }));
+  return snapshots.flatMap(({ projectId, projectRecord }) => projectRecord ? [{ ...projectRecord, id: projectRecord.id || projectId }] : []);
+}
+
 async function readScopedRecords(path, ids) {
   const snapshots = await Promise.all(ids.map(id => get(ref(database, `${path}/${databaseRecordKey(id)}`))));
   return snapshots.flatMap((snapshot, index) => snapshot.exists()
-    ? recordsWithKeys(snapshot.val()).map(record => ({ ...record, id: record.id || ids[index] }))
+    ? [{ ...snapshot.val(), id: snapshot.val()?.id || ids[index] }]
     : []);
 }
 
@@ -1399,7 +1448,10 @@ function startRealtimeSync() {
 function startRegularWorkAdminSync() {
   if (!isSystemAdmin()) return;
   if (stopRegularWorkWatching) stopRegularWorkWatching();
-  stopRegularWorkWatching = onValue(ref(database, regularWorkPath), async () => {
+  let refreshing = false;
+  const refresh = async () => {
+    if (refreshing) return;
+    refreshing = true;
     try {
       const incoming = mergeRegularWorkIntoState(window.firebaseHub.initialState || emptyState(), await readRegularWorkData(authUser.uid, true));
       window.firebaseHub.initialState = incoming;
@@ -1410,8 +1462,11 @@ function startRegularWorkAdminSync() {
     } catch (error) {
       console.error('Could not refresh Admin Regular Work data:', error);
       window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
-    }
-  }, error => console.error('Could not monitor Regular Work data:', error));
+    } finally { refreshing = false; }
+  };
+  const activePaths = [regularWorkOwnersPath, regularWorkTasksPath, regularWorkTaskAccessPath, regularWorkCommentsPath, regularWorkApprovalsPath, regularWorkActivityPath, regularWorkOwnerActivityPath, regularWorkCalendarPath];
+  const stops = activePaths.map(path => onValue(ref(database, path), refresh, error => console.error(`Could not monitor Regular Work data at ${path}:`, error)));
+  stopRegularWorkWatching = () => stops.forEach(stop => stop());
 }
 
 function regularRecordMap(records, includeTask = false) {
@@ -1581,77 +1636,248 @@ window.firebaseHub = {
     if (!['folders', 'categories'].includes(collection) || !ownerUid || !recordId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) {
       throw new Error('You do not have permission to delete this Regular Work record.');
     }
-    await set(ref(database, `${regularWorkOwnersPath}/${ownerUid}/${collection}/${recordId}`), null);
+    const recordPath = `${regularWorkOwnersPath}/${ownerUid}/${collection}/${recordId}`;
+    await set(ref(database, recordPath), null);
+    const saved = await get(ref(database, recordPath));
+    if (saved.exists()) throw new Error(`Delete read-back failed at ${recordPath}.`);
+  },
+  async deleteRegularWorkStructureRecord(collection, ownerUid, recordId, softDelete) {
+    if (!['folders', 'categories'].includes(collection) || !ownerUid || !recordId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) {
+      throw new Error('You do not have permission to delete this Regular Work record.');
+    }
+    const recordPath = `${regularWorkOwnersPath}/${ownerUid}/${collection}/${recordId}`;
+    if (softDelete) {
+      await update(ref(database, recordPath), { deleted: true, deletedAt: new Date().toISOString(), deletedByUid: auth.currentUser?.uid || '' });
+      const saved = await get(ref(database, recordPath));
+      if (!saved.exists() || saved.val()?.deleted !== true) throw new Error(`Delete read-back failed at ${recordPath}.`);
+      return { deleted: true, path: recordPath };
+    }
+    await set(ref(database, recordPath), null);
+    const saved = await get(ref(database, recordPath));
+    if (saved.exists()) throw new Error(`Delete read-back failed at ${recordPath}.`);
+    return { deleted: false, path: recordPath };
+  },
+  async deleteRegularWorkTask(taskId, softDelete) {
+    const taskPath = `${regularWorkTasksPath}/${taskId}`;
+    const current = await get(ref(database, taskPath));
+    const task = current.exists() ? current.val() : null;
+    if (!task || (!isSystemAdmin() && task.owner !== employeeProfile?.appUserId && task.folderOwnerUid !== auth.currentUser?.uid && task.createdByUid !== auth.currentUser?.uid)) {
+      throw new Error('You do not have permission to delete this Regular Work task.');
+    }
+    const dependencies = await Promise.all([
+      get(ref(database, `${regularWorkDailyTasksPath}/${taskId}`)),
+      get(ref(database, `${regularWorkCommentsPath}/${taskId}`)),
+      get(ref(database, `${regularWorkApprovalsPath}/${taskId}`)),
+      get(ref(database, `${regularWorkActivityPath}/${taskId}`)),
+      get(ref(database, `${regularWorkCalendarPath}/${taskId}`))
+    ]);
+    const preserveHistory = softDelete || dependencies.some(snapshot => snapshot.exists());
+    if (preserveHistory) {
+      await update(ref(database, taskPath), { deleted: true, deletedAt: new Date().toISOString(), deletedByUid: auth.currentUser?.uid || '' });
+      const saved = await get(ref(database, taskPath));
+      if (!saved.exists() || saved.val()?.deleted !== true) throw new Error(`Delete read-back failed at ${taskPath}.`);
+      return { deleted: true, path: taskPath };
+    }
+    await set(ref(database, taskPath), null);
+    const saved = await get(ref(database, taskPath));
+    if (saved.exists()) throw new Error(`Delete read-back failed at ${taskPath}.`);
+    return { deleted: false, path: taskPath };
   },
   async saveRegularWorkState(nextState) {
     if (!auth.currentUser) throw new Error('Firebase authentication is required to save Regular Work.');
     await saveRegularWorkData(nextState);
     return true;
   },
-  async saveRegularWorkFolder(ownerUid, folderId, patch, taskLabelPatches = []) {
+  async saveRegularWorkFolder(ownerUid, folderId, patch) {
     if (!ownerUid || !folderId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) throw new Error('You do not have permission to edit this folder.');
     const folderPath = `${regularWorkOwnersPath}/${ownerUid}/folders/${folderId}`;
-    const allowed = ['name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
+    const allowed = ['id', 'ownerUid', 'ownerUserId', 'createdByUid', 'createdBy', 'createdAt', 'name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'deleted', 'deletedAt', 'deletedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
     const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
     console.info('[RW SAVE] folder:', folderPath);
-    await update(ref(database, folderPath), safePatch);
-    for (const item of taskLabelPatches) {
-      if (!item?.taskId) continue;
-      const taskPath = `${regularWorkTasksPath}/${item.taskId}`;
-      console.info('[RW SAVE] task label:', taskPath);
-      await update(ref(database, taskPath), item.patch || {});
-    }
+    const current = await get(ref(database, folderPath));
+    if (current.exists()) await update(ref(database, folderPath), safePatch);
+    else await set(ref(database, folderPath), { ...safePatch, id: folderId, ownerUid });
     const saved = await get(ref(database, folderPath));
     const record = saved.exists() ? saved.val() : null;
-    if (!record || record.id !== folderId || ('name' in safePatch && record.name !== safePatch.name)) throw new Error(`Folder read-back failed at ${folderPath}.`);
+    if (!record || record.id !== folderId || Object.entries(safePatch).some(([key, value]) => value == null ? record[key] != null : record[key] !== value)) throw new Error(`Folder read-back failed at ${folderPath}.`);
+    lastRegularWorkSnapshot.folders = [...recordsFrom(lastRegularWorkSnapshot.folders).filter(item => item.id !== folderId), record];
     return record;
   },
-  async saveRegularWorkCategory(ownerUid, categoryId, patch, taskLabelPatches = []) {
+  async saveRegularWorkCategory(ownerUid, categoryId, patch) {
     if (!ownerUid || !categoryId || (!isSystemAdmin() && ownerUid !== auth.currentUser?.uid)) throw new Error('You do not have permission to edit this category.');
     const categoryPath = `${regularWorkOwnersPath}/${ownerUid}/categories/${categoryId}`;
-    const allowed = ['name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
+    const allowed = ['id', 'ownerUid', 'ownerUserId', 'folderId', 'createdByUid', 'createdBy', 'createdAt', 'name', 'description', 'status', 'archived', 'archivedAt', 'archivedByUid', 'deleted', 'deletedAt', 'deletedByUid', 'updatedAt', 'updatedBy', 'updatedByUid'];
     const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
     console.info('[RW SAVE] category:', categoryPath);
-    await update(ref(database, categoryPath), safePatch);
-    for (const item of taskLabelPatches) {
-      if (!item?.taskId) continue;
-      const taskPath = `${regularWorkTasksPath}/${item.taskId}`;
-      console.info('[RW SAVE] task label:', taskPath);
-      await update(ref(database, taskPath), item.patch || {});
-    }
+    const current = await get(ref(database, categoryPath));
+    if (current.exists()) await update(ref(database, categoryPath), safePatch);
+    else await set(ref(database, categoryPath), { ...safePatch, id: categoryId, ownerUid });
     const saved = await get(ref(database, categoryPath));
     const record = saved.exists() ? saved.val() : null;
-    if (!record || record.id !== categoryId || ('name' in safePatch && record.name !== safePatch.name)) throw new Error(`Category read-back failed at ${categoryPath}.`);
+    if (!record || record.id !== categoryId || Object.entries(safePatch).some(([key, value]) => value == null ? record[key] != null : record[key] !== value)) throw new Error(`Category read-back failed at ${categoryPath}.`);
+    lastRegularWorkSnapshot.categories = [...recordsFrom(lastRegularWorkSnapshot.categories).filter(item => item.id !== categoryId), record];
     return record;
+  },
+  async createRegularWorkTask(record) {
+    const taskId = String(record?.id || ''), actorUid = auth.currentUser?.uid || '';
+    if (!taskId || !actorUid || (!isSystemAdmin() && record?.folderOwnerUid !== actorUid)) throw new Error('You do not have permission to create this Regular Work task.');
+    const taskPath = `${regularWorkTasksPath}/${taskId}`;
+    await set(ref(database, taskPath), record);
+    const saved = await get(ref(database, taskPath));
+    const savedRecord = saved.exists() ? saved.val() : null;
+    if (!savedRecord || savedRecord.id !== taskId || savedRecord.regularFolderId !== record.regularFolderId || savedRecord.regularCategoryId !== record.regularCategoryId) throw new Error(`Task read-back failed at ${taskPath}.`);
+    const appUserIds = [...new Set([record.folderOwnerUserId, record.owner, record.createdBy].filter(Boolean))];
+    await Promise.all(appUserIds.map(async targetAppUserId => {
+      const accessPath = `${regularWorkTaskAccessPath}/${databaseRecordKey(targetAppUserId)}/${databaseRecordKey(taskId)}`;
+      await set(ref(database, accessPath), true);
+      const access = await get(ref(database, accessPath));
+      if (access.val() !== true) throw new Error(`Regular Work task access read-back failed at ${accessPath}.`);
+    }));
+    lastRegularWorkSnapshot.tasks = [...recordsFrom(lastRegularWorkSnapshot.tasks).filter(item => item.id !== taskId), savedRecord];
+    lastRegularWorkSnapshot.access = { ...(lastRegularWorkSnapshot.access || {}), [taskId]: appUserIds };
+    return savedRecord;
   },
   async saveRegularWorkTask(taskId, patch) {
     if (!taskId || !auth.currentUser) throw new Error('You do not have permission to edit this task.');
     const taskPath = `${regularWorkTasksPath}/${taskId}`;
-    const allowed = ['title', 'status', 'priority', 'owner', 'currentDue', 'waitingOn', 'next', 'updatedAt', 'updatedBy', 'updatedByUid', 'archived', 'archivedAt', 'archivedByUid'];
+    const allowed = ['title', 'description', 'status', 'priority', 'owner', 'currentDue', 'waitingOn', 'next', 'updatedAt', 'updatedBy', 'updatedByUid', 'archived', 'archivedAt', 'archivedByUid', 'deleted', 'deletedAt', 'deletedByUid', 'completedAt', 'completedByUid', 'discardedAt', 'discardedByUid', 'holdReason', 'progress'];
     const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    const previousSnapshot = await get(ref(database, taskPath));
+    const previousTask = previousSnapshot.exists() ? previousSnapshot.val() : null;
+    if (!previousTask) throw new Error(`Regular Work task not found at ${taskPath}.`);
     console.info('[RW SAVE] task:', taskPath);
     await update(ref(database, taskPath), safePatch);
     const saved = await get(ref(database, taskPath));
     const record = saved.exists() ? saved.val() : null;
-    if (!record || record.id !== taskId || ('title' in safePatch && record.title !== safePatch.title)) throw new Error(`Task read-back failed at ${taskPath}.`);
+    if (!record || record.id !== taskId || Object.entries(safePatch).some(([key, value]) => value == null ? record[key] != null : record[key] !== value)) throw new Error(`Task read-back failed at ${taskPath}.`);
+    if (Object.hasOwn(safePatch, 'owner') && safePatch.owner !== previousTask.owner) {
+      const newOwnerAccessPath = `${regularWorkTaskAccessPath}/${databaseRecordKey(safePatch.owner)}/${databaseRecordKey(taskId)}`;
+      await set(ref(database, newOwnerAccessPath), true);
+      const newOwnerAccess = await get(ref(database, newOwnerAccessPath));
+      if (newOwnerAccess.val() !== true) throw new Error(`Assignee access read-back failed at ${newOwnerAccessPath}.`);
+      const previousOwnerIsCreatorOrFolderOwner = previousTask.owner === previousTask.createdBy || previousTask.owner === previousTask.folderOwnerUserId;
+      if (!previousOwnerIsCreatorOrFolderOwner) {
+        const oldOwnerAccessPath = `${regularWorkTaskAccessPath}/${databaseRecordKey(previousTask.owner)}/${databaseRecordKey(taskId)}`;
+        await set(ref(database, oldOwnerAccessPath), null);
+        const oldOwnerAccess = await get(ref(database, oldOwnerAccessPath));
+        if (oldOwnerAccess.exists()) throw new Error(`Old assignee access removal read-back failed at ${oldOwnerAccessPath}.`);
+      }
+      lastRegularWorkSnapshot.access = { ...(lastRegularWorkSnapshot.access || {}), [taskId]: [...new Set([...(lastRegularWorkSnapshot.access?.[taskId] || []).filter(id => id !== previousTask.owner), safePatch.owner])] };
+    }
+    lastRegularWorkSnapshot.tasks = [...recordsFrom(lastRegularWorkSnapshot.tasks).filter(item => item.id !== taskId), record];
     return record;
   },
-  async getRegularWorkDailyTasks(parentTaskId) {
-    if (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId)) throw new Error('You do not have access to this Regular Work task.');
-    const snapshot = await get(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}`));
-    return snapshot.exists() ? recordsWithKeys(snapshot.val()) : [];
+  async saveRegularWorkTaskStatus(taskId, patch, activity) {
+    const actorUid = auth.currentUser?.uid || '', activityId = String(activity?.id || ''), taskKey = databaseRecordKey(taskId || '');
+    if (!actorUid || !taskId || !activityId || activity?.task !== taskId) throw new Error('Regular Work status data is incomplete or the session is not ready.');
+    const taskPath = `${regularWorkTasksPath}/${taskKey}`;
+    const currentSnapshot = await get(ref(database, taskPath));
+    const currentTask = currentSnapshot.exists() ? currentSnapshot.val() : null;
+    const appUserId = employeeProfile?.appUserId || '';
+    if (!currentTask || (!isSystemAdmin() && currentTask.owner !== appUserId && currentTask.createdByUid !== actorUid && currentTask.folderOwnerUid !== actorUid)) throw new Error('You do not have permission to update this Regular Work task status.');
+
+    const allowed = ['status', 'completedAt', 'completedByUid', 'discardedAt', 'discardedByUid', 'holdReason', 'progress', 'updatedAt', 'updatedByUid'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    if (!['Pending', 'In Progress', 'Working', 'On Hold', 'Ready for Review', 'Completed', 'Discarded'].includes(safePatch.status)) throw new Error('Unsupported Regular Work task status.');
+    const savedActivity = { ...activity, contextType: 'regular_work', authorUid: actorUid, actorUid, createdByUid: actorUid };
+    const updates = Object.fromEntries(Object.entries(safePatch).map(([field, value]) => [`tasks/${taskKey}/${field}`, value]));
+    updates[`activity/${taskKey}/${databaseRecordKey(activityId)}`] = savedActivity;
+    await update(ref(database, regularWorkPath), updates);
+
+    const activityPath = `${regularWorkActivityPath}/${taskKey}/${databaseRecordKey(activityId)}`;
+    const [taskReadBack, activityReadBack] = await Promise.all([get(ref(database, taskPath)), get(ref(database, activityPath))]);
+    const savedTask = taskReadBack.exists() ? taskReadBack.val() : null;
+    const savedEvent = activityReadBack.exists() ? activityReadBack.val() : null;
+    if (!savedTask || savedTask.id !== taskId || Object.entries(safePatch).some(([key, value]) => value == null ? savedTask[key] != null : savedTask[key] !== value)) throw new Error(`Regular Work task status read-back failed at ${taskPath}.`);
+    if (!savedEvent || savedEvent.id !== activityId || savedEvent.task !== taskId || savedEvent.createdByUid !== actorUid) throw new Error(`Regular Work status activity read-back failed at ${activityPath}.`);
+
+    lastRegularWorkSnapshot.tasks = [...recordsFrom(lastRegularWorkSnapshot.tasks).filter(item => item.id !== taskId), savedTask];
+    lastRegularWorkSnapshot.activity = [...recordsFrom(lastRegularWorkSnapshot.activity).filter(item => !(item.task === taskId && item.id === activityId)), savedEvent];
+    return { task: savedTask, activity: savedEvent };
   },
-  async saveRegularWorkDailyTask(parentTaskId, dailyTask) {
-    if (!dailyTask?.id || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(parentTaskId))) throw new Error('You do not have access to save a Daily Task here.');
-    try {
-      await set(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}/${dailyTask.id}`), dailyTask);
-    } catch (error) {
-      const permissionDenied = error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
-      if (permissionDenied) {
-        throw new Error('Firebase denied this Daily Task write. The deployed Realtime Database rules may be out of date; deploy the rules from database.rules.json and retry.');
-      }
-      throw error;
+  async saveRegularWorkActivity(activity) {
+    const taskId = String(activity?.task || ''), activityId = String(activity?.id || ''), actorUid = auth.currentUser?.uid || '';
+    if (!taskId || !activityId || !actorUid || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(taskId))) throw new Error('You do not have permission to save this Regular Work activity.');
+    const event = { ...activity, contextType: 'regular_work', authorUid: activity.authorUid || actorUid, actorUid: activity.actorUid || actorUid, createdByUid: activity.createdByUid || actorUid };
+    const activityPath = `${regularWorkActivityPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(activityId)}`;
+    await set(ref(database, activityPath), event);
+    const saved = await get(ref(database, activityPath));
+    if (!saved.exists() || saved.val()?.id !== activityId || saved.val()?.task !== taskId) throw new Error(`Activity read-back failed at ${activityPath}.`);
+    lastRegularWorkSnapshot.activity = [...recordsFrom(lastRegularWorkSnapshot.activity).filter(item => !(item.task === taskId && item.id === activityId)), saved.val()];
+    return saved.val();
+  },
+  async saveRegularWorkApproval(approval) {
+    const taskId = String(approval?.task || ''), approvalId = String(approval?.id || ''), actorUid = auth.currentUser?.uid || '';
+    const appUserId = employeeProfile?.appUserId || '';
+    const taskSnapshot = taskId ? await get(ref(database, `${regularWorkTasksPath}/${databaseRecordKey(taskId)}`)) : null;
+    const task = taskSnapshot?.exists() ? taskSnapshot.val() : null;
+    if (!actorUid || !approvalId || !task || (!isSystemAdmin() && task.owner !== appUserId && task.createdByUid !== actorUid && task.folderOwnerUid !== actorUid)) throw new Error('You do not have permission to send this task for approval.');
+    const record = { ...approval, contextType: 'regular_work', project: null, authorUid: actorUid, actorUid, createdByUid: actorUid };
+    const approvalPath = `${regularWorkApprovalsPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(approvalId)}`;
+    await set(ref(database, approvalPath), record);
+    const saved = await get(ref(database, approvalPath));
+    if (!saved.exists() || saved.val()?.id !== approvalId || saved.val()?.task !== taskId || saved.val()?.createdByUid !== actorUid) throw new Error(`Approval read-back failed at ${approvalPath}.`);
+    lastRegularWorkSnapshot.approvals = [...recordsFrom(lastRegularWorkSnapshot.approvals).filter(item => !(item.task === taskId && item.id === approvalId)), saved.val()];
+    return saved.val();
+  },
+  async saveRegularWorkCalendarEvent(event) {
+    const taskId = String(event?.regularWorkTaskId || event?.task || ''), eventId = String(event?.id || ''), actorUid = auth.currentUser?.uid || '';
+    if (!taskId || !eventId || !actorUid || (!isSystemAdmin() && !window.firebaseHub.canAccessRegularWorkTask(taskId))) throw new Error('You do not have permission to save this Regular Work Planner item.');
+    const participants = Array.isArray(event.participants) ? event.participants : [];
+    const record = { ...event, task: taskId, regularWorkTaskId: taskId, contextType: 'regular_work', participantUserIds: Object.fromEntries(participants.map(id => [id, true])), authorUid: event.authorUid || actorUid, actorUid: event.actorUid || actorUid, createdByUid: event.createdByUid || actorUid };
+    const eventPath = `${regularWorkCalendarPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(eventId)}`;
+    await set(ref(database, eventPath), record);
+    const saved = await get(ref(database, eventPath));
+    if (!saved.exists() || saved.val()?.id !== eventId || saved.val()?.task !== taskId) throw new Error(`Planner read-back failed at ${eventPath}.`);
+    lastRegularWorkSnapshot.calendarEvents = [...recordsFrom(lastRegularWorkSnapshot.calendarEvents).filter(item => !(item.id === eventId && (item.regularWorkTaskId || item.task) === taskId)), saved.val()];
+    return saved.val();
+  },
+  async saveProjectWithAccess(projectRecord, previousProject = null, accounts = []) {
+    if (!isSystemAdmin() || !projectRecord?.id) throw new Error('Only the System Admin can save project access assignments.');
+    const projectId = String(projectRecord.id);
+    const profilesSnapshot = await get(ref(database, employeeProfilesPath));
+    const profiles = Object.entries(profilesSnapshot.exists() ? profilesSnapshot.val() : {});
+    const profileUidByAppUserId = new Map(profiles.map(([uid, profile]) => [profile?.appUserId, uid]).filter(([appUserId]) => !!appUserId));
+    const appUserIdByAuthUid = new Map(profiles.map(([uid, profile]) => [uid, profile?.appUserId]).filter(([, appUserId]) => !!appUserId));
+    const appUserIdFor = identifier => {
+      const value = String(identifier || '');
+      if (!value) return '';
+      if (profileUidByAppUserId.has(value)) return value;
+      if (appUserIdByAuthUid.has(value)) return appUserIdByAuthUid.get(value);
+      const account = recordsFrom(accounts).find(item => item.id === value || item.authUid === value);
+      return account?.id || value;
+    };
+    const canonicalProject = {
+      ...projectRecord,
+      projectLead: appUserIdFor(projectRecord.projectLead),
+      team: [...new Set([...(projectRecord.team || []), projectRecord.projectLead].filter(Boolean).map(appUserIdFor))]
+    };
+    const canonicalPreviousProject = previousProject && {
+      ...previousProject,
+      projectLead: appUserIdFor(previousProject.projectLead),
+      team: [...new Set([...(previousProject.team || []), previousProject.projectLead].filter(Boolean).map(appUserIdFor))]
+    };
+    const authUidFor = appUserId => profileUidByAppUserId.get(appUserId) || recordsFrom(accounts).find(account => account.id === appUserId)?.authUid || '';
+    const oldMembers = new Set([canonicalPreviousProject?.projectLead, ...(canonicalPreviousProject?.team || [])].filter(Boolean));
+    const nextMembers = new Set([canonicalProject.projectLead, ...(canonicalProject.team || [])].filter(Boolean));
+    const unresolved = [...new Set([...oldMembers, ...nextMembers])].filter(appUserId => !authUidFor(appUserId));
+    if (unresolved.length) throw new Error(`Cannot save project access because these appUserId values have no Firebase Auth UID: ${unresolved.join(', ')}.`);
+    const updates = { [`${sharedProjectsPath}/${databaseRecordKey(projectId)}`]: canonicalProject };
+    for (const appUserId of new Set([...oldMembers, ...nextMembers])) {
+      const uid = authUidFor(appUserId);
+      if (!uid) continue;
+      updates[`${userViewsPath}/${uid}/projectAccess/${databaseRecordKey(projectId)}`] = nextMembers.has(appUserId) ? true : null;
     }
+    await update(ref(database), updates);
+    const saved = await get(ref(database, `${sharedProjectsPath}/${databaseRecordKey(projectId)}`));
+    if (!saved.exists() || saved.val()?.id !== projectId) throw new Error(`Project read-back failed at ${sharedProjectsPath}/${projectId}.`);
+    const accessReadBack = await Promise.all([...new Set([...oldMembers, ...nextMembers])].map(async appUserId => {
+      const uid = authUidFor(appUserId);
+      const snapshot = await get(ref(database, `${userViewsPath}/${uid}/projectAccess/${databaseRecordKey(projectId)}`));
+      return { appUserId, hasAccess: snapshot.val() === true };
+    }));
+    if (accessReadBack.some(result => result.hasAccess !== nextMembers.has(result.appUserId))) throw new Error(`Project access read-back failed for ${projectId}.`);
+    return saved.val();
   },
   async saveRegularWorkComment(comment, activity) {
     const actorUid = auth.currentUser?.uid;
@@ -1708,22 +1934,6 @@ window.firebaseHub = {
     } catch (error) {
       throw error;
     }
-  },
-  watchRegularWorkDailyTasks(parentTaskIds, callback, onError = () => {}) {
-    if (typeof callback !== 'function') return () => {};
-    const ids = [...new Set(parentTaskIds || [])];
-    if (isSystemAdmin()) {
-      return onValue(ref(database, regularWorkDailyTasksPath), snapshot => {
-        const all = snapshot.exists() ? snapshot.val() : {};
-        ids.forEach(parentTaskId => callback(parentTaskId, recordsWithKeys(all?.[parentTaskId] || {})));
-      }, error => { onError(null, error); console.error('Could not monitor Daily Tasks:', error); });
-    }
-    const stops = ids
-      .filter(parentTaskId => isSystemAdmin() || window.firebaseHub.canAccessRegularWorkTask(parentTaskId))
-      .map(parentTaskId => onValue(ref(database, `${regularWorkDailyTasksPath}/${parentTaskId}`), snapshot => {
-        callback(parentTaskId, snapshot.exists() ? recordsWithKeys(snapshot.val()) : []);
-      }, error => { onError(parentTaskId, error); console.error(`Could not monitor Daily Tasks for ${parentTaskId}:`, error); }));
-    return () => stops.forEach(stop => stop());
   },
   friendlyError: friendlyAuthError,
   async createEmployeeAccount(email, password, profile) {

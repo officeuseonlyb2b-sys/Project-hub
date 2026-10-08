@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Regular Work status menu DOM test</title>
+  <link rel="stylesheet" href="../styles.css">
+  <style>
+    body{padding:24px;background:#f4f5f1}.app-shell{min-height:0}.drawer{position:relative;right:auto;top:auto;height:auto;max-height:90vh;transform:none;margin:auto}.drawer-backdrop{display:none}.fixture-result{margin:0 0 16px;padding:12px;border-radius:10px;background:#fff;border:1px solid #e4e7e1;font:13px ui-monospace,monospace;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <pre id="fixture-result" class="fixture-result">Running status menu DOM test…</pre>
+  <div class="app-shell"><main class="main"><section id="taskDrawer" class="drawer open" aria-label="Task drawer">
+    <header class="drawer-head"><div><span id="drawerEyebrow" class="eyebrow"></span><h2 id="drawerTitle"></h2></div><button id="closeDrawer" type="button" aria-label="Close">×</button></header>
+    <div id="drawerBody" class="drawer-body"></div>
+  </section></main></div>
+  <div id="drawerBackdrop" class="drawer-backdrop"></div>
+  <div id="modalBackdrop"><div id="modalBody"></div></div>
+  <input id="globalSearch" type="search" hidden>
+  <div id="content"></div>
+  <div id="toast"></div>
+  <script src="../regular-work-task-status.js"></script>
+  <script src="regular-work-status-menu.fixture.js"></script>
+  <script src="../phase19.js"></script>
+  <script src="regular-work-status-menu.test.js"></script>
+</body>
+</html>

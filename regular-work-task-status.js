@@ -3,27 +3,39 @@
   if (typeof module === 'object' && module.exports) module.exports = helpers;
   else root.regularWorkTaskStatus = helpers;
 })(globalThis, function () {
-  const statusOptions = ['Not Started', 'In Progress', 'Waiting', 'Blocked', 'Ready for Review', 'Changes Required', 'Completed'];
+  const statusOptions = ['Pending', 'In Progress', 'Working', 'On Hold', 'Ready for Review', 'Completed', 'Discarded'];
 
-  function createRegularWorkTaskStatusChange(task, nextStatus, actorUid, completedAt = new Date().toISOString()) {
+  function createRegularWorkTaskStatusChange(task, nextStatus, actorUid, changedAt = new Date().toISOString()) {
     if (!task || typeof nextStatus !== 'string' || !statusOptions.includes(nextStatus)) return null;
-    const previousStatus = task.status || 'Not Started';
+    const previousStatus = task.status || 'Pending';
+    const normalizedPreviousStatus = previousStatus === 'Not Started' ? 'Pending' : previousStatus;
     if (previousStatus === nextStatus) return null;
 
     const updates = { status: nextStatus };
     if (nextStatus === 'Completed') {
-      updates.completedAt = completedAt;
+      updates.completedAt = changedAt;
       updates.completedByUid = actorUid;
-    } else if (previousStatus === 'Completed') {
+    } else if (normalizedPreviousStatus === 'Completed') {
       updates.completedAt = null;
       updates.completedByUid = null;
+    }
+    if (nextStatus === 'Discarded') {
+      updates.discardedAt = changedAt;
+      updates.discardedByUid = actorUid;
+    } else if (normalizedPreviousStatus === 'Discarded') {
+      updates.discardedAt = null;
+      updates.discardedByUid = null;
     }
 
     const activityVerb = nextStatus === 'Completed'
       ? 'completed this task'
-      : previousStatus === 'Completed'
+      : normalizedPreviousStatus === 'Completed'
         ? 'reopened this task'
-        : `changed status from ${previousStatus} to ${nextStatus}`;
+        : nextStatus === 'Discarded'
+          ? 'discarded this task'
+          : normalizedPreviousStatus === 'Discarded'
+            ? 'reopened this discarded task'
+            : `changed status from ${previousStatus} to ${nextStatus}`;
 
     return { previousStatus, nextStatus, updates, activityVerb };
   }
