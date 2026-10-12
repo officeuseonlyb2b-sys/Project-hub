@@ -423,6 +423,7 @@
     const commentBox=commentSection?.querySelector('.comment-box');if(commentBox)commentSection.appendChild(commentBox);
     if(activitySection){activitySection.classList.add('rw-activity-section');const heading=activitySection.querySelector('h4');if(heading)heading.textContent='Activity'}
   };
+
   el('closeDrawer').addEventListener('click',()=>document.body.classList.remove('regular-task-drawer'));
   el('drawerBackdrop').addEventListener('click',()=>document.body.classList.remove('regular-task-drawer'));
 

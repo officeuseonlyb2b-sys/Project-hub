@@ -21,7 +21,7 @@
   const overdueState=item=>!isTerminal(item);
   const priorityWeight=priority=>priority==='P0'?4:priority==='P1'?3:priority==='P2'?2:1;
   const priorityLabel=priority=>({P0:'P0 · Critical',P1:'P1 · High',P2:'P2 · Medium',P3:'P3 · Low'})[priority]||priority||'—';
-  let dateFilter='today',workFilter='all',scopeFilter='my',chartDays=7;
+  let dateFilter='today',workFilter='all',scopeFilter='my',chartDays=7,departmentFilterId='';
   let shareMode=false,drillCleanup=null;
   const title='My Work Snapshot';
 
@@ -100,9 +100,13 @@
     });
   }
   function departmentPeople(){
-    if(allEmployeesSelected())return new Set((state.users||[]).filter(person=>person.active!==false&&person.id!=='u1').map(person=>person.id));
-    const profile=userById(uid()),departmentId=profile.departmentId;
-    return new Set((state.users||[]).filter(person=>person.active!==false&&(departmentId?person.departmentId===departmentId:person.dept===profile.dept)).map(person=>person.id));
+    const departmentId=departmentFilterId;
+    if(!departmentId)return new Set();
+    return new Set((state.users||[]).filter(person=>person.active!==false&&person.departmentId===departmentId).map(person=>person.id));
+  }
+  function departmentOptionsMarkup(){
+    const departments=(state.departments||[]).filter(department=>department.active!==false&&department.id).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+    return `<select class="dwp-select" id="dwpDepartment" aria-label="Department"><option value="">Select Department</option>${departments.map(department=>`<option value="${esc(department.id)}" ${departmentFilterId===department.id?'selected':''}>${esc(department.name||department.id)}</option>`).join('')}</select>`;
   }
   function scopeItems(scope=scopeFilter,type=workFilter){
     let parents=parentTasksForScope(scope,type);
@@ -301,7 +305,7 @@
     const nextMeetingItem=nextMeeting(events),controlText=metrics.control==null?'—':`${metrics.control}%`;
     setTitle(title,'DAILY WORK PERFORMANCE');document.body.classList.add('dwp-page-active');
     const content=el('content');content.innerHTML=`<main class="dwp-page">
-      <section class="dwp-toolbar"><div class="dwp-date-switch" role="tablist" aria-label="Snapshot date">${dateButtonMarkup()}</div><div class="dwp-toolbar-right">${employeeSnapshotMarkup()}<select class="dwp-select" id="dwpWorkType" aria-label="Work type">${optionsMarkup([['all','All Work'],['project','Project Work'],['regular','Regular Work']],workFilter)}</select><select class="dwp-select" id="dwpScope" aria-label="Scope"><option value="my" ${scopeFilter==='my'?'selected':''}>My View</option><option value="team" ${scopeFilter==='team'?'selected':''} ${canTeamScope()?'':'disabled'}>Team View${canTeamScope()?'':' · Unavailable'}</option><option value="department" ${scopeFilter==='department'?'selected':''} ${isAdmin()?'':'disabled'}>Department View${isAdmin()?'':' · Unavailable'}</option></select><button type="button" class="dwp-primary" id="dwpShareButton">▣ Share Snapshot</button></div></section>
+      <section class="dwp-toolbar"><div class="dwp-date-switch" role="tablist" aria-label="Snapshot date">${dateButtonMarkup()}</div><div class="dwp-toolbar-right">${employeeSnapshotMarkup()}<select class="dwp-select" id="dwpWorkType" aria-label="Work type">${optionsMarkup([['all','All Work'],['project','Project Work'],['regular','Regular Work']],workFilter)}</select><select class="dwp-select" id="dwpScope" aria-label="Scope"><option value="my" ${scopeFilter==='my'?'selected':''}>My View</option><option value="team" ${scopeFilter==='team'?'selected':''} ${canTeamScope()?'':'disabled'}>Team View${canTeamScope()?'':' · Unavailable'}</option><option value="department" ${scopeFilter==='department'?'selected':''} ${isAdmin()?'':'disabled'}>Department View${isAdmin()?'':' · Unavailable'}</option></select>${scopeFilter==='department'&&isAdmin()?departmentOptionsMarkup():''}<button type="button" class="dwp-primary" id="dwpShareButton">▣ Share Snapshot</button></div></section>
       <section class="dwp-hero"><div><span class="dwp-eyebrow">TODAY</span><h2>${esc(todayLabel)}</h2><p>Your operational view across projects, regular work, approvals and planner.</p></div><div class="dwp-control-score"><strong>${controlText}</strong><span>Work under control</span>${metrics.control==null?'<small>Not enough due-work data</small>':'<small>Based on on-time due items in this date range</small>'}</div></section>
       ${renderKpiGrid(metrics)}
       <section class="dwp-two-col"><article class="dwp-card"><div class="dwp-section-head"><div><h3>Day-by-day comparison</h3><p>Yesterday, today and tomorrow at a glance.</p></div></div>${renderComparison(items,events)}</article><article class="dwp-card"><div class="dwp-section-head"><div><h3>Approvals &amp; reviews</h3><p>What needs a decision in this date range.</p></div><button type="button" class="dwp-text-button" data-dwp-open-view="approvals">View approvals →</button></div>${renderApprovalCard(approvalsGroups)}</article></section>
@@ -335,7 +339,9 @@
     const employeeSelect=document.getElementById('dwpEmployeeSnapshot');
     if(employeeSelect)employeeSelect.onchange=event=>{snapshotEmployeeId=event.target.value;renderDailyWork()};
     document.getElementById('dwpWorkType').onchange=event=>{workFilter=event.target.value;renderDailyWork()};
-    document.getElementById('dwpScope').onchange=event=>{scopeFilter=event.target.value;if(!scopeAllowed(scopeFilter))scopeFilter='my';renderDailyWork()};
+    document.getElementById('dwpScope').onchange=event=>{scopeFilter=event.target.value;if(!scopeAllowed(scopeFilter))scopeFilter='my';if(scopeFilter==='department'&&!departmentFilterId)departmentFilterId=(state.departments||[]).find(department=>department.active!==false&&department.id)?.id||'';renderDailyWork()};
+    const departmentSelect=document.getElementById('dwpDepartment');
+    if(departmentSelect)departmentSelect.onchange=event=>{departmentFilterId=event.target.value;renderDailyWork()};
     document.querySelectorAll('[data-dwp-range]').forEach(button=>button.onclick=()=>{chartDays=Number(button.dataset.dwpRange);renderDailyWork()});
     document.getElementById('dwpShareButton').onclick=()=>openShareSnapshot(items,approvals,events,metrics,windowRange,approvalGroups);
     document.querySelectorAll('[data-dwp-kpi]').forEach(button=>button.onclick=()=>{

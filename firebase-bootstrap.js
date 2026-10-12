@@ -22,6 +22,7 @@ const AUTHENTICATED = 'AUTHENTICATED';
 const SIGNED_OUT = 'SIGNED_OUT';
 const VERIFICATION_REQUIRED = 'VERIFICATION_REQUIRED';
 const firebaseConfig = {
+  projectId: 'project-hub-emp',
   apiKey: 'AIzaSyC0gOy_JIaIpds2BdoHGv20EZiuHt8ozvM',
   authDomain: 'project-hub-emp.firebaseapp.com',
   databaseURL: 'https://project-hub-emp-default-rtdb.asia-southeast1.firebasedatabase.app',
@@ -146,6 +147,8 @@ function logAuthIdentity(user) {
   const emailMatches = user?.email?.toLowerCase() === SYSTEM_ADMIN_EMAIL.toLowerCase();
   const emailVerified = user?.emailVerified === true;
   console.info('Firebase Auth identity', {
+    'LOCAL PROJECT ID': firebaseConfig.projectId,
+    'DEPLOYED PROJECT ID': 'project-hub-emp',
     'AUTH UID': user?.uid || '',
     'AUTH EMAIL': user?.email || '',
     'EMAIL VERIFIED': emailVerified
