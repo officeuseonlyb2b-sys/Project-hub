@@ -21,6 +21,8 @@ const uidInactive = 'employee-inactive-auth';
 const appA = 'empA';
 const appB = 'empB';
 const appInactive = 'empInactive';
+const uidC = 'employee-c-auth';
+const appC = 'empC';
 const migrationUid = 'scoped-migration-auth';
 const migrationAppId = 'scoped-migration-app';
 const results = [];
@@ -174,6 +176,7 @@ async function seedFixtures() {
         users: {
           [uidA]: profile(uidA, appA, 'employee-a@example.test'),
           [uidB]: profile(uidB, appB, 'employee-b@example.test'),
+          [uidC]: profile(uidC, appC, 'employee-c@example.test'),
           [uidInactive]: profile(uidInactive, appInactive, 'inactive@example.test', 'exited'),
           [migrationUid]: profile(migrationUid, migrationAppId, 'scoped-migration@example.test'),
           [trustedSystemAdminUid]: profile(trustedSystemAdminUid, 'systemAdmin', systemAdminEmail, 'active', 'admin')
@@ -210,7 +213,8 @@ async function seedFixtures() {
             taskAccess: { 'task-a': true },
             approvalAccess: { 'approval-a': true },
             calendarAccess: { 'event-a': true }
-          }
+          },
+          [uidC]: { projectAccess: { 'project-a': true } }
         },
         userWork: {
           [uidA]: { plannerRead: { 'event-a-empA': true }, note: 'private-a' },
@@ -231,8 +235,8 @@ async function seedFixtures() {
         workspaces: { default: { state: { marker: 'legacy-default-state' } } },
         shared: {
           projects: {
-            'project-a': { id: 'project-a', name: 'Project A', projectLead: appA, owner: appA, createdBy: uidA, team: [appA] },
-            'project-b': { id: 'project-b', name: 'Project B', projectLead: appB, team: [appB] }
+            'project-a': { id: 'project-a', name: 'Project A', projectLead: appA, owner: appA, createdBy: uidA, team: [appA], memberIds: { [appA]: true, [appC]: true, [migrationAppId]: true } },
+            'project-b': { id: 'project-b', name: 'Project B', projectLead: appB, team: [appB], memberIds: { [appB]: true } }
           },
           tasks: {
             'task-a': { id: 'task-a', project: 'project-a', owner: appA, createdByUid: uidA, reviewer: appB, title: 'Assigned to A' },
@@ -664,6 +668,20 @@ async function runMatrix() {
 
   await expectAllowed('Employee A (task owner)', 'executionHub/shared/tasks/task-a/status', 'write status', set(ref(a, 'executionHub/shared/tasks/task-a/status'), 'In Progress'));
   await expectAllowed('Employee A (project member)', 'executionHub/shared/comments/task-a/comment-a', 'write comment', set(ref(a, 'executionHub/shared/comments/task-a/comment-a'), { id: 'comment-a', task: 'task-a', user: appA, text: 'Progress update' }));
+  const projectTask = (id, owner, creator = appC, creatorUid = uidC) => ({ id, project: 'project-a', owner, createdBy: creator, createdByUid: creatorUid, title: id, status: 'Pending' });
+  const c = env.authenticatedContext(uidC, { email: 'employee-c@example.test' }).database();
+  await expectAllowed('Employee C (Project member)', 'executionHub/shared/tasks/proj-task-self', 'create Project task for self', set(ref(c, 'executionHub/shared/tasks/proj-task-self'), projectTask('proj-task-self', appC)));
+  await expectAllowed('Employee C (Project member)', 'executionHub/shared/tasks/proj-task-teammate', 'assign Project task to another Project member', set(ref(c, 'executionHub/shared/tasks/proj-task-teammate'), projectTask('proj-task-teammate', appA)));
+  await expectDenied('Employee C (Project member)', 'executionHub/shared/tasks/proj-task-outsider', 'assign Project task to a non-member', set(ref(c, 'executionHub/shared/tasks/proj-task-outsider'), projectTask('proj-task-outsider', appB)));
+  await expectAllowed('Employee C (task creator)', 'executionHub/shared/tasks/proj-task-teammate', 'reassign own Project task to another member', set(ref(c, 'executionHub/shared/tasks/proj-task-teammate'), projectTask('proj-task-teammate', migrationAppId)));
+  await expectDenied('Employee C (task creator)', 'executionHub/shared/tasks/proj-task-teammate', 'reassign own Project task to a non-member', set(ref(c, 'executionHub/shared/tasks/proj-task-teammate'), projectTask('proj-task-teammate', appB)));
+  await expectDenied('Employee B (non-member)', 'executionHub/shared/tasks/proj-task-intruder', 'create task in another Project', set(ref(b, 'executionHub/shared/tasks/proj-task-intruder'), { ...projectTask('proj-task-intruder', appB, appB, uidB) }));
+  await expectAllowed('Employee C (Project member)', 'executionHub/shared/projectTasks/project-a/proj-task-self', 'index Project task', set(ref(c, 'executionHub/shared/projectTasks/project-a/proj-task-self'), true));
+  await expectDenied('Employee B (non-member)', 'executionHub/shared/projectTasks/project-a/proj-task-self-b', 'index task in another Project', set(ref(b, 'executionHub/shared/projectTasks/project-a/proj-task-self-b'), true));
+  await expectAllowed('Employee C (Project member)', 'executionHub/shared/projectTasks/project-a', 'read Project task index', get(ref(c, 'executionHub/shared/projectTasks/project-a')));
+  await expectDenied('Employee B (non-member)', 'executionHub/shared/projectTasks/project-a', 'read another Project task index', get(ref(b, 'executionHub/shared/projectTasks/project-a')));
+  await expectAllowed('Employee C (Project member)', 'executionHub/shared/activity/proj-task-self/act-created', 'write Project task activity through Project grant', set(ref(c, 'executionHub/shared/activity/proj-task-self/act-created'), { id: 'act-created', task: 'proj-task-self', user: appC, text: 'created task' }));
+  await expectDenied('Employee B (non-member)', 'executionHub/shared/activity/proj-task-self/act-intruder', 'write activity on another Project task', set(ref(b, 'executionHub/shared/activity/proj-task-self/act-intruder'), { id: 'act-intruder', task: 'proj-task-self', user: appB, text: 'intruder' }));
   await expectAllowed('Employee A (requester)', 'executionHub/shared/approvals/approval-a-new', 'create approval', set(ref(a, 'executionHub/shared/approvals/approval-a-new'), { id: 'approval-a-new', requestedBy: appA, approvers: [appB], approverIds: { [appB]: true }, task: 'task-a', status: 'Pending' }));
   await expectAllowed('Employee B (assigned approver)', 'executionHub/shared/approvals/approval-a/decisions/empB', 'write decision', set(ref(b, 'executionHub/shared/approvals/approval-a/decisions/empB'), { status: 'Approved', at: '2026-10-03T10:00:00.000Z' }));
   await expectAllowed('Employee B (Planner participant)', 'executionHub/shared/calendar/event-b/responses/empB', 'write own RSVP', set(ref(b, 'executionHub/shared/calendar/event-b/responses/empB'), 'accepted'));

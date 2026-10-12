@@ -201,7 +201,7 @@ test('project assignment atomically maintains employee project access indexes', 
   assert.ok(projectSave.includes('sharedProjectsPath'));
   assert.ok(projectSave.includes('userViewsPath'));
   assert.ok(projectSave.includes('projectAccess'));
-  assert.ok(projectSave.includes('nextMembers.has(appUserId) ? true : null'));
+  assert.ok(projectSave.includes('projectAccessUpdates('));
   assert.ok(projectSave.includes('Project access read-back failed'));
   assert.ok(phase13Source.includes('saveProjectWithAccess(record,null,state.users)'));
   assert.ok(phase13Source.includes('saveProjectWithAccess(updated,before,state.users)'));
@@ -286,4 +286,40 @@ test('Regular Work dashboard maps On Hold and Discarded out of Active Load', () 
   assert.ok(phase20Source.includes("['Cancelled','Canceled','Discarded']"));
   assert.ok(phase20Source.includes("'discarded'].includes(String(item.status||'').toLowerCase())"));
   assert.ok(phase20Source.includes("['On Hold','Waiting','Blocked'].includes(status)"));
+});
+
+test('Project hydration validates grants against Lead/Team and discovers tasks through the project index', () => {
+  const hydration = authSource.slice(authSource.indexOf('async function readEmployeeWorkspace(profile)'), authSource.indexOf('async function readEmployeeProjectRecords'));
+  assert.ok(hydration.includes('isProjectMember(project, profile.appUserId)'));
+  assert.ok(hydration.includes('sharedProjectTasksPath'));
+  assert.ok(hydration.includes('ignoring stale grants'));
+  assert.ok(authSource.includes('function projectAccessUpdates('));
+  assert.ok(authSource.includes('reconcileCanonicalProjectAccess'));
+  assert.ok(authSource.includes('syncAdminCanonicalRecords(state)'));
+});
+
+test('Project tasks persist through a read-back save and carry creation attribution', () => {
+  assert.ok(authSource.includes('async saveProjectTask(task, activity = null)'));
+  assert.ok(authSource.includes('Project task read-back failed'));
+  assert.ok(phase13Source.includes('await window.firebaseHub.saveProjectTask(t,activity)'));
+  assert.ok(phase13Source.includes('createdAt:now,createdBy:state.currentUser'));
+  assert.ok(phase13Source.includes('await window.firebaseHub.saveProjectTask(next,activity)'));
+  assert.ok(phase13Source.includes("type:'Status'"));
+});
+
+test('Project routes persist the Project and tab in the URL hash', () => {
+  const routing = require('./view-routing.js');
+  assert.equal(routing.resolveView('#projects/p123/tasks'), 'projects');
+  assert.deepEqual(routing.parseProjectRoute('#projects/p123/tasks'), { projectId: 'p123', tab: 'tasks' });
+  assert.deepEqual(routing.parseProjectRoute('#projects/p123'), { projectId: 'p123', tab: 'overview' });
+  assert.equal(routing.parseProjectRoute('#dashboard'), null);
+  let hash = '#projects/p123/tasks';
+  const location = { get hash() { return hash; } };
+  const history = { pushState: (_s, _t, next) => { hash = next; }, replaceState: (_s, _t, next) => { hash = next; } };
+  const router = routing.createViewRouter({ location, history });
+  assert.deepEqual(router.route, { projectId: 'p123', tab: 'tasks' });
+  router.sync('projects', { projectId: 'p123', tab: 'team' });
+  assert.equal(hash, '#projects/p123/team');
+  router.sync('projects', null);
+  assert.equal(hash, '#projects');
 });

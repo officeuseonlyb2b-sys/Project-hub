@@ -46,6 +46,13 @@ const viewRouter = window.executionHubViewRouting?.createViewRouter({
 let activeView = viewRouter?.current || 'dashboard';
 let activeProject = null;
 let activeProjectTab = 'overview';
+let pendingProjectRoute = viewRouter?.route || null;
+function resolvePendingProjectRoute(){
+  if(!pendingProjectRoute||!state.currentUser)return;
+  const route=pendingProjectRoute;pendingProjectRoute=null;
+  if(!project(route.projectId))return;
+  activeView='projects';activeProject=route.projectId;activeProjectTab=route.tab||'overview';
+}
 const today = new Date();
 
 const el = id => document.getElementById(id);
@@ -77,6 +84,7 @@ window.refreshFirebaseView = () => {
   state.currentUser = profile.id;
   populateUserSelect();
   updateUserBadge();
+  resolvePendingProjectRoute();
   render();
 };
 const fmtDate = d => new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
@@ -121,13 +129,17 @@ function bindShell(){
 
 function setTitle(title,eyebrow='MANAGEMENT'){el('pageTitle').textContent=title;el('pageEyebrow').textContent=eyebrow;syncViewRoute()}
 function syncViewRoute(){
-  if(viewRouter)activeView=viewRouter.sync(activeView);
+  if(viewRouter&&!pendingProjectRoute){
+    if(activeProject)activeView='projects';
+    activeView=viewRouter.sync(activeView,activeProject?{projectId:activeProject,tab:activeProjectTab}:null);
+  }
   document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
 }
 function restoreViewRoute(){
   if(!viewRouter)return;
   const restored=viewRouter.restore();if(!restored)return;
-  activeView=restored;activeProject=null;activeProjectTab='overview';
+  const route=viewRouter.route;
+  activeView=restored;activeProject=route&&project(route.projectId)?route.projectId:null;activeProjectTab=activeProject?route.tab:'overview';
   document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
   render();
 }

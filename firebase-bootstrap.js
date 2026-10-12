@@ -37,6 +37,7 @@ const employeeDirectoryPath = 'executionHub/workspace/employeeVisibleData/direct
 const safeEmployeeDirectoryPath = 'executionHub/employeeDirectory/safe';
 const sharedProjectsPath = 'executionHub/shared/projects';
 const sharedTasksPath = 'executionHub/shared/tasks';
+const sharedProjectTasksPath = 'executionHub/shared/projectTasks';
 const sharedApprovalsPath = 'executionHub/shared/approvals';
 const sharedCommentsPath = 'executionHub/shared/comments';
 const sharedActivityPath = 'executionHub/shared/activity';
@@ -295,6 +296,19 @@ function recordsFrom(value) {
   return [];
 }
 
+function projectMemberIds(project) {
+  const team = Array.isArray(project?.team) ? project.team : Object.values(project?.team || {});
+  return [...new Set([project?.projectLead, ...team].filter(id => typeof id === 'string' && id))];
+}
+
+function isProjectMember(project, appUserId) {
+  return !!appUserId && projectMemberIds(project).includes(appUserId);
+}
+
+function isPermissionDenied(error) {
+  return error?.code === 'PERMISSION_DENIED' || String(error?.message || '').toLowerCase().includes('permission denied');
+}
+
 function recordIdentity(record, index) {
   return String(record?.id ?? `legacy-${index}`);
 }
@@ -444,7 +458,180 @@ async function readWorkspace() {
     ...privateCollectionsSnapshot(adminPrivateData)
   });
   captureRecordKeys(state, workspaceCollections, workspaceRecordKeys);
+  overlayCanonicalProjectData(state, await readCanonicalProjectData());
   return state;
+}
+
+// Firebase drops nulls and empty containers, so compare records in that normalized form.
+function canonicalJson(value) {
+  const normalize = item => {
+    if (Array.isArray(item)) {
+      const list = item.map(normalize).filter(entry => entry !== undefined);
+      return list.length ? list : undefined;
+    }
+    if (item && typeof item === 'object') {
+      const entries = Object.keys(item).sort().map(key => [key, normalize(item[key])]).filter(([, entry]) => entry !== undefined);
+      return entries.length ? Object.fromEntries(entries) : undefined;
+    }
+    return item === null || item === undefined ? undefined : item;
+  };
+  return JSON.stringify(normalize(value)) ?? '';
+}
+
+let canonicalProjectJson = new Map();
+let canonicalTaskJson = new Map();
+const canonicalEventKeys = new Set();
+let canonicalEventKeysSeeded = false;
+
+async function readCanonicalProjectData() {
+  const [projects, tasks] = await Promise.all([get(ref(database, sharedProjectsPath)), get(ref(database, sharedTasksPath))]);
+  return { projects: projects.exists() ? projects.val() : {}, tasks: tasks.exists() ? tasks.val() : {} };
+}
+
+// shared/projects and shared/tasks are the canonical records; the Admin legacy blob only fills gaps.
+function overlayCanonicalProjectData(state, canonical) {
+  const projects = new Map(recordsFrom(state.projects).map(project => [String(project.id), project]));
+  const sharedProjects = new Map();
+  Object.entries(canonical.projects || {}).forEach(([key, record]) => {
+    if (!record || typeof record !== 'object') return;
+    const id = String(record.id || key);
+    sharedProjects.set(id, { ...record, id });
+    projects.set(id, { ...(projects.get(id) || {}), ...record, id });
+  });
+  const regularTasks = recordsFrom(state.tasks).filter(task => task.contextType === 'regular_work');
+  const projectTasks = new Map(recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work').map(task => [String(task.id), task]));
+  const sharedTasks = new Map();
+  Object.entries(canonical.tasks || {}).forEach(([key, record]) => {
+    if (!record || typeof record !== 'object') return;
+    const id = String(record.id || key);
+    sharedTasks.set(id, { ...record, id });
+    projectTasks.set(id, { ...record, id });
+  });
+  state.projects = [...projects.values()];
+  state.tasks = [...regularTasks, ...projectTasks.values()];
+  canonicalProjectJson = new Map([...sharedProjects].map(([id, record]) => [id, canonicalJson(record)]));
+  canonicalTaskJson = new Map([...sharedTasks].map(([id, record]) => [id, canonicalJson(record)]));
+  if (!canonicalEventKeysSeeded) {
+    canonicalEventKeysSeeded = true;
+    recordsFrom(state.activity).forEach(event => event.task && canonicalEventKeys.add(`a:${event.task}/${event.id}`));
+    recordsFrom(state.comments).forEach(comment => comment.task && canonicalEventKeys.add(`c:${comment.task}/${comment.id}`));
+  }
+  return state;
+}
+
+async function writeProjectTaskRecord(task) {
+  await set(ref(database, `${sharedTasksPath}/${databaseRecordKey(task.id)}`), JSON.parse(JSON.stringify(task)));
+  if (task.project) await set(ref(database, `${sharedProjectTasksPath}/${databaseRecordKey(task.project)}/${databaseRecordKey(task.id)}`), true);
+}
+
+// Admin changes live in the legacy blob; mirror them into the canonical shared records employees read.
+async function syncAdminCanonicalRecords(state) {
+  const failures = [];
+  for (const project of recordsFrom(state.projects)) {
+    if (!project?.id || canonicalJson(project) === canonicalProjectJson.get(String(project.id))) continue;
+    try {
+      const saved = await window.firebaseHub.saveProjectWithAccess(project, null, state.users);
+      canonicalProjectJson.set(String(project.id), canonicalJson(saved));
+    } catch (error) {
+      failures.push(error);
+      console.error(`Could not save canonical project ${project.id}:`, error);
+    }
+  }
+  const projectTasks = recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work' && task.project);
+  for (const task of projectTasks) {
+    if (canonicalJson(task) === canonicalTaskJson.get(String(task.id))) continue;
+    try {
+      await writeProjectTaskRecord(task);
+      canonicalTaskJson.set(String(task.id), canonicalJson(task));
+    } catch (error) {
+      failures.push(error);
+      console.error(`Could not save canonical task ${task.id}:`, error);
+    }
+  }
+  const taskIds = new Set(projectTasks.map(task => String(task.id)));
+  for (const [prefix, path, records] of [['a', sharedActivityPath, state.activity], ['c', sharedCommentsPath, state.comments]]) {
+    for (const record of recordsFrom(records)) {
+      const key = `${prefix}:${record.task}/${record.id}`;
+      if (!record.task || !record.id || !taskIds.has(String(record.task)) || record.contextType === 'regular_work' || canonicalEventKeys.has(key)) continue;
+      try {
+        await set(ref(database, `${path}/${databaseRecordKey(record.task)}/${databaseRecordKey(record.id)}`), record);
+        canonicalEventKeys.add(key);
+      } catch (error) {
+        failures.push(error);
+        console.error(`Could not save project task ${prefix === 'a' ? 'activity' : 'comment'} ${key}:`, error);
+      }
+    }
+  }
+  if (failures.length) throw failures[0];
+}
+
+// Grants must mirror each project's current Lead + Team; this is the single place that computes them.
+function projectAccessUpdates(projects, profiles, views, { pruneUnknownProjects = false } = {}) {
+  const updates = {};
+  const activeUidByAppUserId = new Map(Object.entries(profiles || {})
+    .filter(([, profile]) => profile?.role === 'employee' && profile?.status === 'active' && profile?.appUserId)
+    .map(([uid, profile]) => [profile.appUserId, uid]));
+  const projectIds = new Set(projects.map(project => String(project.id)));
+  const uids = new Set([...Object.keys(profiles || {}), ...Object.keys(views || {})]);
+  for (const project of projects) {
+    const projectId = String(project.id), key = databaseRecordKey(projectId);
+    const desired = new Set(projectMemberIds(project).map(id => activeUidByAppUserId.get(id)).filter(Boolean));
+    for (const uid of uids) {
+      if (uid === TRUSTED_SYSTEM_ADMIN_UID) continue;
+      const view = views?.[uid] || {};
+      if (desired.has(uid)) {
+        if (view.projectAccess?.[key] !== true) updates[`${userViewsPath}/${uid}/projectAccess/${key}`] = true;
+        if (view.teamAccess?.[key] !== true) updates[`${userViewsPath}/${uid}/teamAccess/${key}`] = true;
+      } else {
+        if (view.projectAccess?.[key] !== undefined) updates[`${userViewsPath}/${uid}/projectAccess/${key}`] = null;
+        if (view.teamAccess?.[key] !== undefined) updates[`${userViewsPath}/${uid}/teamAccess/${key}`] = null;
+      }
+    }
+  }
+  if (pruneUnknownProjects) {
+    for (const [uid, view] of Object.entries(views || {})) {
+      if (uid === TRUSTED_SYSTEM_ADMIN_UID) continue;
+      for (const field of ['projectAccess', 'teamAccess']) {
+        Object.keys(view?.[field] || {}).forEach(key => {
+          if (!projectIds.has(decodeURIComponent(key))) updates[`${userViewsPath}/${uid}/${field}/${key}`] = null;
+        });
+      }
+    }
+  }
+  return updates;
+}
+
+// Runs for the Admin after load: repairs stale or missing grants and the task index for every project.
+async function reconcileCanonicalProjectAccess(state) {
+  if (!isSystemAdmin()) return;
+  const [profilesSnapshot, viewsSnapshot, indexSnapshot, canonical] = await Promise.all([
+    get(ref(database, employeeProfilesPath)),
+    get(ref(database, userViewsPath)),
+    get(ref(database, sharedProjectTasksPath)),
+    readCanonicalProjectData()
+  ]);
+  const projects = recordsFrom(state.projects).filter(project => project?.id).map(project => ({
+    ...project,
+    projectLead: project.projectLead || '',
+    team: [...new Set(projectMemberIds(project))]
+  }));
+  const updates = projectAccessUpdates(projects, profilesSnapshot.exists() ? profilesSnapshot.val() : {}, viewsSnapshot.exists() ? viewsSnapshot.val() : {}, { pruneUnknownProjects: true });
+  const index = indexSnapshot.exists() ? indexSnapshot.val() : {};
+  Object.entries(canonical.tasks || {}).forEach(([key, task]) => {
+    if (!task?.project) return;
+    const projectKey = databaseRecordKey(task.project), taskKey = databaseRecordKey(task.id || key);
+    if (index?.[projectKey]?.[taskKey] !== true) updates[`${sharedProjectTasksPath}/${projectKey}/${taskKey}`] = true;
+  });
+  projects.forEach(project => {
+    const shared = canonical.projects?.[databaseRecordKey(project.id)];
+    const memberIds = Object.fromEntries(projectMemberIds(project).map(id => [id, true]));
+    const next = { ...project, memberIds };
+    if (!shared || canonicalJson(shared) !== canonicalJson(next)) updates[`${sharedProjectsPath}/${databaseRecordKey(project.id)}`] = JSON.parse(JSON.stringify(next));
+  });
+  const count = Object.keys(updates).length;
+  if (!count) return;
+  console.info(`[PROJECT ACCESS] reconciling ${count} canonical project/grant/index records`);
+  await update(ref(database), updates);
 }
 
 function recordsWithKeys(value) {
@@ -637,17 +824,30 @@ async function readEmployeeWorkspace(profile) {
   console.info('[PROJECT ACCESS] grants:', userView.projectAccess || {});
   console.info('[PROJECT ACCESS] projectIds:', projectIds);
   if (!projectIds.length) console.warn('NO PROJECT ACCESS GRANTS FOUND');
-  const taskIds = [...new Set([
+  const taskAccessIds = [...new Set([
     ...Object.keys(userView.taskAccess || {}).filter(id => userView.taskAccess[id] === true),
     ...Object.keys(userView.projectTaskAccess || {}).filter(id => userView.projectTaskAccess[id] === true)
   ])];
   const approvalIds = Object.keys(userView.approvalAccess || {}).filter(id => userView.approvalAccess[id] === true);
   const calendarIds = Object.keys(userView.calendarAccess || {}).filter(id => userView.calendarAccess[id] === true);
-  const [projects, tasks, approvals, calendarEvents, commentsByTask, activityByTask] = await Promise.all([
+  const [grantedProjects, approvals, calendarEvents] = await Promise.all([
     readEmployeeProjectRecords(projectIds),
-    readScopedRecords(sharedTasksPath, taskIds),
     readScopedRecords(sharedApprovalsPath, approvalIds),
-    readScopedRecords(sharedCalendarPath, calendarIds),
+    readScopedRecords(sharedCalendarPath, calendarIds)
+  ]);
+  // A grant alone never exposes a project; the person must currently be Lead or Team Member.
+  const projects = grantedProjects.filter(project => isProjectMember(project, profile.appUserId));
+  const staleProjectIds = grantedProjects.filter(project => !projects.includes(project)).map(project => project.id);
+  if (staleProjectIds.length) console.warn('[PROJECT ACCESS] ignoring stale grants:', staleProjectIds);
+  const memberProjectIds = new Set(projects.map(project => project.id));
+  const indexedTaskIds = (await Promise.all([...memberProjectIds].map(async projectId => {
+    const { snapshot } = await readEmployeeOptionalPath(`${sharedProjectTasksPath}/${databaseRecordKey(projectId)}`, 'project task index');
+    return snapshot?.exists() ? Object.keys(snapshot.val() || {}) : [];
+  }))).flat();
+  const candidateTasks = await readScopedRecords(sharedTasksPath, [...new Set([...taskAccessIds, ...indexedTaskIds])]);
+  const tasks = candidateTasks.filter(task => task.project ? memberProjectIds.has(task.project) || task.owner === profile.appUserId : true);
+  const taskIds = tasks.map(task => task.id);
+  const [commentsByTask, activityByTask] = await Promise.all([
     readScopedGroupedRecords(sharedCommentsPath, taskIds),
     readScopedGroupedRecords(sharedActivityPath, taskIds)
   ]);
@@ -661,8 +861,8 @@ async function readEmployeeWorkspace(profile) {
     status: account.active ? 'active' : 'inactive'
   }));
   const state = { ...emptyState(), ...userWork, ...directory, users: safeUsers, ...privateCollectionsSnapshot(privateData) };
-  state.projects = mergeRecordsById(userWork.projects, projects);
-  state.tasks = mergeRecordsById(userWork.tasks, tasks);
+  state.projects = mergeRecordsById(projects, recordsFrom(userWork.projects).filter(project => isProjectMember(project, profile.appUserId)));
+  state.tasks = mergeRecordsById(tasks, recordsFrom(userWork.tasks).filter(task => !task.project || memberProjectIds.has(task.project) || task.owner === profile.appUserId));
   state.approvals = mergeRecordsById(userWork.approvals, approvals);
   state.calendarEvents = mergeRecordsById(userWork.calendarEvents, calendarEvents);
   state.comments = mergeRecordsById(userWork.comments, commentsByTask);
@@ -678,9 +878,19 @@ async function readEmployeeWorkspace(profile) {
   return normalizeWorkspace(state);
 }
 
+async function getOrAbsent(path) {
+  try {
+    return await get(ref(database, path));
+  } catch (error) {
+    if (!isPermissionDenied(error)) throw error;
+    console.warn(`[SCOPED READ] skipped unreadable record ${path}`);
+    return { exists: () => false, val: () => null };
+  }
+}
+
 async function readEmployeeProjectRecords(projectIds) {
   const snapshots = await Promise.all(projectIds.map(async projectId => {
-    const snapshot = await get(ref(database, `${sharedProjectsPath}/${databaseRecordKey(projectId)}`));
+    const snapshot = await getOrAbsent(`${sharedProjectsPath}/${databaseRecordKey(projectId)}`);
     const projectRecord = snapshot.exists() ? snapshot.val() : null;
     console.info('[PROJECT LOAD] projectId:', projectId);
     console.info('[PROJECT LOAD] found:', !!projectRecord);
@@ -692,14 +902,14 @@ async function readEmployeeProjectRecords(projectIds) {
 }
 
 async function readScopedRecords(path, ids) {
-  const snapshots = await Promise.all(ids.map(id => get(ref(database, `${path}/${databaseRecordKey(id)}`))));
+  const snapshots = await Promise.all(ids.map(id => getOrAbsent(`${path}/${databaseRecordKey(id)}`)));
   return snapshots.flatMap((snapshot, index) => snapshot.exists()
     ? [{ ...snapshot.val(), id: snapshot.val()?.id || ids[index] }]
     : []);
 }
 
 async function readScopedGroupedRecords(path, ids) {
-  const snapshots = await Promise.all(ids.map(id => get(ref(database, `${path}/${databaseRecordKey(id)}`))));
+  const snapshots = await Promise.all(ids.map(id => getOrAbsent(`${path}/${databaseRecordKey(id)}`)));
   return snapshots.flatMap((snapshot, index) => snapshot.exists()
     ? recordsWithKeys(snapshot.val()).map(record => ({ ...record, task: record.task || ids[index] }))
     : []);
@@ -707,19 +917,26 @@ async function readScopedGroupedRecords(path, ids) {
 
 async function saveEmployeeScopedChanges(state) {
   const previous = lastApplicationState || emptyState();
-  const saveChanged = async (path, beforeRecords, afterRecords, keyForRecord = record => record?.id, prepareRecord = record => record) => {
+  const saveChanged = async (path, beforeRecords, afterRecords, keyForRecord = record => record?.id, prepareRecord = record => record, afterSave = null) => {
     const before = new Map(recordsFrom(beforeRecords).map(record => [String(keyForRecord(record) || ''), record]));
     for (const record of recordsFrom(afterRecords)) {
       const id = String(keyForRecord(record) || '');
       if (!id || JSON.stringify(before.get(id)) === JSON.stringify(record)) continue;
       await set(ref(database, `${path}/${databaseRecordKey(id)}`), prepareRecord(record));
+      if (afterSave) await afterSave(record);
     }
   };
   const projectTaskIds = new Set(recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work').map(task => String(task.id)));
-  await saveChanged(sharedProjectsPath, previous.projects, state.projects);
+  const ownAppUserId = employeeProfile?.appUserId;
+  await saveChanged(sharedProjectsPath,
+    recordsFrom(previous.projects),
+    recordsFrom(state.projects).filter(project => project.projectLead === ownAppUserId));
   await saveChanged(sharedTasksPath,
     recordsFrom(previous.tasks).filter(task => task.contextType !== 'regular_work'),
-    recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work'));
+    recordsFrom(state.tasks).filter(task => task.contextType !== 'regular_work'),
+    record => record?.id,
+    record => record,
+    task => task.project ? set(ref(database, `${sharedProjectTasksPath}/${databaseRecordKey(task.project)}/${databaseRecordKey(task.id)}`), true) : null);
   await saveChanged(sharedApprovalsPath,
     recordsFrom(previous.approvals).filter(approval => !approval.contextType || approval.contextType !== 'regular_work'),
     recordsFrom(state.approvals).filter(approval => !approval.contextType || approval.contextType !== 'regular_work'),
@@ -1393,7 +1610,7 @@ function startRealtimeSync() {
     if (pending) window.firebaseHub.saveState(pending);
     return;
   }
-  stopWatching = onValue(ref(database, workspacePath), async snapshot => {
+  const applyAdminWorkspace = async snapshot => {
     if (!snapshot.exists()) return;
     const mergedOperational = recoveryPending && recoveryContext
       ? mergeData(snapshot.val(), cleanWorkspaceState(recoveryContext.legacy))
@@ -1404,6 +1621,7 @@ function startRealtimeSync() {
       incoming.departments = adminManagement.departments || incoming.departments;
       ensureAdminProfile(incoming, authUser);
       Object.assign(incoming, clonePrivateCollections(lastPrivateData));
+      incoming = overlayCanonicalProjectData(incoming, await readCanonicalProjectData());
       incoming = mergeRegularWorkIntoState(incoming, await readRegularWorkData(authUser.uid, true));
     }
     else return;
@@ -1415,11 +1633,24 @@ function startRealtimeSync() {
       window.applyFirebaseState(incoming);
       window.refreshFirebaseView();
     }
-  }, error => {
+  };
+  const stopWorkspaceWatch = onValue(ref(database, workspacePath), applyAdminWorkspace, error => {
     console.error('Firebase live sync failed:', error);
     window.dispatchEvent(new CustomEvent('firebase-save-error', { detail: error }));
   });
+  let canonicalRefreshing = false;
+  const refreshFromCanonical = async () => {
+    if (canonicalRefreshing) return;
+    canonicalRefreshing = true;
+    try { await applyAdminWorkspace(await get(ref(database, workspacePath))); }
+    catch (error) { console.error('Could not refresh canonical project data:', error); }
+    finally { canonicalRefreshing = false; }
+  };
+  const stopProjectWatch = onValue(ref(database, sharedProjectsPath), refreshFromCanonical, error => console.error('Could not monitor canonical projects:', error));
+  const stopTaskWatch = onValue(ref(database, sharedTasksPath), refreshFromCanonical, error => console.error('Could not monitor canonical project tasks:', error));
+  stopWatching = () => { stopWorkspaceWatch(); stopProjectWatch(); stopTaskWatch(); };
   if (isSystemAdmin()) {
+    reconcileCanonicalProjectAccess(window.firebaseHub.initialState || emptyState()).catch(error => console.error('Could not reconcile project access grants:', error));
     startPrivateAdminSync();
     startAdminManagementSync();
     startRegularWorkAdminSync();
@@ -1835,8 +2066,9 @@ window.firebaseHub = {
   async saveProjectWithAccess(projectRecord, previousProject = null, accounts = []) {
     if (!isSystemAdmin() || !projectRecord?.id) throw new Error('Only the System Admin can save project access assignments.');
     const projectId = String(projectRecord.id);
-    const profilesSnapshot = await get(ref(database, employeeProfilesPath));
-    const profiles = Object.entries(profilesSnapshot.exists() ? profilesSnapshot.val() : {});
+    const [profilesSnapshot, viewsSnapshot] = await Promise.all([get(ref(database, employeeProfilesPath)), get(ref(database, userViewsPath))]);
+    const rawProfiles = profilesSnapshot.exists() ? profilesSnapshot.val() : {};
+    const profiles = Object.entries(rawProfiles);
     const profileUidByAppUserId = new Map(profiles.map(([uid, profile]) => [profile?.appUserId, uid]).filter(([appUserId]) => !!appUserId));
     const appUserIdByAuthUid = new Map(profiles.map(([uid, profile]) => [uid, profile?.appUserId]).filter(([, appUserId]) => !!appUserId));
     const appUserIdFor = identifier => {
@@ -1852,32 +2084,60 @@ window.firebaseHub = {
       projectLead: appUserIdFor(projectRecord.projectLead),
       team: [...new Set([...(projectRecord.team || []), projectRecord.projectLead].filter(Boolean).map(appUserIdFor))]
     };
-    const canonicalPreviousProject = previousProject && {
-      ...previousProject,
-      projectLead: appUserIdFor(previousProject.projectLead),
-      team: [...new Set([...(previousProject.team || []), previousProject.projectLead].filter(Boolean).map(appUserIdFor))]
-    };
-    const authUidFor = appUserId => profileUidByAppUserId.get(appUserId) || recordsFrom(accounts).find(account => account.id === appUserId)?.authUid || '';
-    const oldMembers = new Set([canonicalPreviousProject?.projectLead, ...(canonicalPreviousProject?.team || [])].filter(Boolean));
-    const nextMembers = new Set([canonicalProject.projectLead, ...(canonicalProject.team || [])].filter(Boolean));
-    const unresolved = [...new Set([...oldMembers, ...nextMembers])].filter(appUserId => !authUidFor(appUserId));
+    canonicalProject.memberIds = Object.fromEntries(projectMemberIds(canonicalProject).map(id => [id, true]));
+    const nextMembers = new Set(projectMemberIds(canonicalProject));
+    const unresolved = [...nextMembers].filter(appUserId => appUserId !== 'u1' && !profileUidByAppUserId.has(appUserId));
     if (unresolved.length) throw new Error(`Cannot save project access because these appUserId values have no Firebase Auth UID: ${unresolved.join(', ')}.`);
-    const updates = { [`${sharedProjectsPath}/${databaseRecordKey(projectId)}`]: canonicalProject };
-    for (const appUserId of new Set([...oldMembers, ...nextMembers])) {
-      const uid = authUidFor(appUserId);
-      if (!uid) continue;
-      updates[`${userViewsPath}/${uid}/projectAccess/${databaseRecordKey(projectId)}`] = nextMembers.has(appUserId) ? true : null;
-    }
+    const updates = {
+      [`${sharedProjectsPath}/${databaseRecordKey(projectId)}`]: JSON.parse(JSON.stringify(canonicalProject)),
+      ...projectAccessUpdates([canonicalProject], rawProfiles, viewsSnapshot.exists() ? viewsSnapshot.val() : {})
+    };
     await update(ref(database), updates);
     const saved = await get(ref(database, `${sharedProjectsPath}/${databaseRecordKey(projectId)}`));
     if (!saved.exists() || saved.val()?.id !== projectId) throw new Error(`Project read-back failed at ${sharedProjectsPath}/${projectId}.`);
-    const accessReadBack = await Promise.all([...new Set([...oldMembers, ...nextMembers])].map(async appUserId => {
-      const uid = authUidFor(appUserId);
-      const snapshot = await get(ref(database, `${userViewsPath}/${uid}/projectAccess/${databaseRecordKey(projectId)}`));
-      return { appUserId, hasAccess: snapshot.val() === true };
-    }));
-    if (accessReadBack.some(result => result.hasAccess !== nextMembers.has(result.appUserId))) throw new Error(`Project access read-back failed for ${projectId}.`);
+    const accessReadBack = await Promise.all(profiles
+      .filter(([uid, profile]) => uid !== TRUSTED_SYSTEM_ADMIN_UID && profile?.appUserId)
+      .map(async ([uid, profile]) => {
+        const snapshot = await get(ref(database, `${userViewsPath}/${uid}/projectAccess/${databaseRecordKey(projectId)}`));
+        const expected = profile.role === 'employee' && profile.status === 'active' && nextMembers.has(profile.appUserId);
+        return { appUserId: profile.appUserId, ok: (snapshot.val() === true) === expected };
+      }));
+    if (accessReadBack.some(result => !result.ok)) throw new Error(`Project access read-back failed for ${projectId}.`);
     return saved.val();
+  },
+  async saveProjectTask(task, activity = null) {
+    const actorUid = auth.currentUser?.uid || '';
+    const taskId = String(task?.id || ''), projectId = String(task?.project || '');
+    if (!actorUid || !appDataWritesEnabled || !taskId || !projectId || task?.contextType === 'regular_work') {
+      throw new Error('Project task data is incomplete or the session is not ready.');
+    }
+    const record = JSON.parse(JSON.stringify(task));
+    const taskPath = `${sharedTasksPath}/${databaseRecordKey(taskId)}`;
+    await set(ref(database, taskPath), record);
+    await set(ref(database, `${sharedProjectTasksPath}/${databaseRecordKey(projectId)}/${databaseRecordKey(taskId)}`), true);
+    let activityPath = null;
+    if (activity?.id) {
+      activityPath = `${sharedActivityPath}/${databaseRecordKey(taskId)}/${databaseRecordKey(activity.id)}`;
+      await set(ref(database, activityPath), JSON.parse(JSON.stringify(activity)));
+    }
+    const [taskSnapshot, indexSnapshot, activitySnapshot] = await Promise.all([
+      get(ref(database, taskPath)),
+      get(ref(database, `${sharedProjectTasksPath}/${databaseRecordKey(projectId)}/${databaseRecordKey(taskId)}`)),
+      activityPath ? get(ref(database, activityPath)) : Promise.resolve(null)
+    ]);
+    const savedTask = taskSnapshot.exists() ? taskSnapshot.val() : null;
+    if (!savedTask || canonicalJson(savedTask) !== canonicalJson(record) || indexSnapshot.val() !== true) throw new Error(`Project task read-back failed at ${taskPath}.`);
+    const savedActivity = activitySnapshot?.exists() ? activitySnapshot.val() : null;
+    if (activityPath && (!savedActivity || savedActivity.id !== activity.id || savedActivity.task !== taskId)) throw new Error(`Project task activity read-back failed at ${activityPath}.`);
+    if (lastApplicationState) {
+      lastApplicationState.tasks = [...recordsFrom(lastApplicationState.tasks).filter(item => item.id !== taskId), savedTask];
+      if (savedActivity) lastApplicationState.activity = [...recordsFrom(lastApplicationState.activity).filter(item => !(item.task === taskId && item.id === savedActivity.id)), savedActivity];
+    }
+    if (isSystemAdmin()) {
+      canonicalTaskJson.set(taskId, canonicalJson(savedTask));
+      if (savedActivity) canonicalEventKeys.add(`a:${taskId}/${savedActivity.id}`);
+    }
+    return { task: savedTask, activity: savedActivity };
   },
   async saveRegularWorkComment(comment, activity) {
     const actorUid = auth.currentUser?.uid;
@@ -2035,7 +2295,10 @@ window.firebaseHub = {
     if (json === lastStateJson && !regularChanged && (!admin || (!safeEmployeeDirectoryNeedsSync && privateJson === lastPrivateJson && directoryJson === JSON.stringify(safeDirectory(adminManagement)) && managementJson === JSON.stringify(adminManagement)))) return true;
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       if (json !== lastStateJson) {
-        if (admin) await set(ref(database, workspacePath), cleaned);
+        if (admin) {
+          await set(ref(database, workspacePath), cleaned);
+          await syncAdminCanonicalRecords(state);
+        }
         else await saveEmployeeScopedChanges(state);
         lastStateJson = json;
       }
