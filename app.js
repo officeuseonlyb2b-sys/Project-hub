@@ -46,12 +46,13 @@ const viewRouter = window.executionHubViewRouting?.createViewRouter({
 let activeView = viewRouter?.current || 'dashboard';
 let activeProject = null;
 let activeProjectTab = 'overview';
+let activeProjectCategoryId = '';
 let pendingProjectRoute = viewRouter?.route || null;
 function resolvePendingProjectRoute(){
   if(!pendingProjectRoute||!state.currentUser)return;
   const route=pendingProjectRoute;pendingProjectRoute=null;
   if(!project(route.projectId))return;
-  activeView='projects';activeProject=route.projectId;activeProjectTab=route.tab||'overview';
+  activeView='projects';activeProject=route.projectId;activeProjectTab=route.tab||'overview';activeProjectCategoryId=route.categoryId||'';
 }
 const today = new Date();
 
@@ -61,6 +62,12 @@ window.executionHubEscapeHtml = escapeHtml;
 const user = id => state.users.find(u=>u.id===id) || {name:id,initials:'?',role:''};
 const project = id => state.projects.find(p=>p.id===id);
 const task = id => state.tasks.find(t=>t.id===id);
+function projectWorkstreamCategoryId(projectRecord, workstream){
+  const name=typeof workstream==='string'?workstream:workstream?.name||'';
+  const category=typeof workstream==='object'&&workstream?workstream:projectWorkstreams(projectRecord).find(item=>item.name===name);
+  const existingTaskCategoryId=state.tasks.find(item=>item.project===projectRecord?.id&&item.workstream===name&&item.categoryId&&item.categoryId!==name)?.categoryId;
+  return window.executionHubViewRouting?.categoryIdForProject(projectRecord?.id,{...category,name,id:category?.id||category?.categoryId||existingTaskCategoryId})||String(category?.id||category?.categoryId||existingTaskCategoryId||`${projectRecord?.id}:${name}`);
+}
 const save = () => {
   state.users.forEach(account => {
     delete account.passwordHash;
@@ -131,7 +138,7 @@ function setTitle(title,eyebrow='MANAGEMENT'){el('pageTitle').textContent=title;
 function syncViewRoute(){
   if(viewRouter&&!pendingProjectRoute){
     if(activeProject)activeView='projects';
-    activeView=viewRouter.sync(activeView,activeProject?{projectId:activeProject,tab:activeProjectTab}:null);
+    activeView=viewRouter.sync(activeView,activeProject?{projectId:activeProject,tab:activeProjectTab,...(activeProjectTab==='tasks'&&activeProjectCategoryId?{categoryId:activeProjectCategoryId}:{})}:null);
   }
   document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
 }
@@ -139,7 +146,7 @@ function restoreViewRoute(){
   if(!viewRouter)return;
   const restored=viewRouter.restore();if(!restored)return;
   const route=viewRouter.route;
-  activeView=restored;activeProject=route&&project(route.projectId)?route.projectId:null;activeProjectTab=activeProject?route.tab:'overview';
+  activeView=restored;activeProject=route&&project(route.projectId)?route.projectId:null;activeProjectTab=activeProject?route.tab:'overview';activeProjectCategoryId=activeProject?route.categoryId||'':'';
   document.querySelectorAll('.nav-item').forEach(button=>button.classList.toggle('active',button.dataset.view===activeView));
   render();
 }
@@ -229,6 +236,7 @@ function renderProjects(search=''){
 
 function renderProject(pid){
   const p=project(pid); if(!p){activeProject=null;activeProjectTab='overview';renderProjects();return}
+  if(activeProjectTab!=='tasks'||!projectWorkstreams(p).some(workstream=>projectWorkstreamCategoryId(p,workstream)===activeProjectCategoryId))activeProjectCategoryId='';
   setTitle(p.name,`${p.category.toUpperCase()} • ${p.code}`);
   const tasks=state.tasks.filter(t=>t.project===pid);
   const overdue=tasks.filter(isOverdue).length;
@@ -279,16 +287,17 @@ function renderProjectWorkstreams(p,tasks){
       const over=wt.filter(isOverdue).length;
       const owners=[...new Set(wt.map(t=>t.owner))];
       const progress=Math.max(0,Math.min(100,Number(w.progress)||0));
-      return `<div class="workstream-card"><div class="workstream-card-head"><div><div class="eyebrow">WORKSTREAM</div><h3>${escapeHtml(w.name)}</h3></div><strong>${progress}%</strong></div><div class="progress"><span style="width:${progress}%"></span></div><div class="workstream-metrics"><span><b>${wt.length}</b> Tasks</span><span><b>${open}</b> Open</span><span class="${over?'risk-text':''}"><b>${over}</b> Overdue</span></div><div class="avatar-stack">${owners.length?owners.map(uid=>`<span title="${escapeHtml(user(uid).name)}">${escapeHtml(user(uid).initials)}</span>`).join(''):'<em>No assigned tasks yet</em>'}</div>${wt.length?`<div class="workstream-task-list">${wt.slice(0,3).map(t=>`<button class="mini-task" data-task="${escapeHtml(t.id)}"><span>${escapeHtml(t.title)}</span>${priorityPill(t.priority)}</button>`).join('')}${wt.length>3?`<div class="subtle">+${wt.length-3} more task${wt.length-3===1?'':'s'}</div>`:''}</div>`:`<div class="empty compact"><strong>No tasks yet</strong>This workstream is ready for task planning.</div>`}</div>`;
+      const categoryId=projectWorkstreamCategoryId(p,w);
+      return `<div class="workstream-card"><div class="workstream-card-head"><div><div class="eyebrow">WORKSTREAM</div><h3>${escapeHtml(w.name)}</h3></div><strong>${progress}%</strong></div><div class="progress"><span style="width:${progress}%"></span></div><div class="workstream-metrics"><span><b>${wt.length}</b> Tasks</span><span><b>${open}</b> Open</span><span class="${over?'risk-text':''}"><b>${over}</b> Overdue</span></div><div class="avatar-stack">${owners.length?owners.map(uid=>`<span title="${escapeHtml(user(uid).name)}">${escapeHtml(user(uid).initials)}</span>`).join(''):'<em>No assigned tasks yet</em>'}</div>${wt.length?`<div class="workstream-task-list">${wt.slice(0,3).map(t=>`<button class="mini-task" data-task="${escapeHtml(t.id)}"><span>${escapeHtml(t.title)}</span>${priorityPill(t.priority)}</button>`).join('')}${wt.length>3?`<button type="button" class="category-more" data-project-category-more="${escapeHtml(categoryId)}" aria-label="Show all ${wt.length-3} more tasks in ${escapeHtml(w.name)}">+${wt.length-3} more task${wt.length-3===1?'':'s'}</button>`:''}</div>`:`<div class="empty compact"><strong>No tasks yet</strong>This workstream is ready for task planning.</div>`}</div>`;
     }).join('')}</div>`;
 }
 
 function renderProjectTasks(p,tasks){
-  const workstreams=[...new Set(tasks.map(t=>t.workstream))].sort();
-  return `<div class="section-row" style="margin-top:0"><div><h2>All project tasks</h2><p>${tasks.length} tasks across ${workstreams.length} workstreams.</p></div><div class="filters"><select class="select" id="projectWorkstreamFilter"><option value="">All Workstreams</option>${workstreams.map(w=>`<option value="${escapeHtml(w)}">${escapeHtml(w)}</option>`).join('')}</select><select class="select" id="projectStatusFilter"><option value="">All Statuses</option>${[...new Set(tasks.map(t=>t.status))].map(st=>`<option value="${escapeHtml(st)}">${escapeHtml(st)}</option>`).join('')}</select></div></div>
-    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Owner</th><th>Priority</th><th>Status</th><th>Progress</th><th>Due</th><th>Next Action</th></tr></thead><tbody id="projectTaskRows">${tasks.map(projectTaskRow).join('')}</tbody></table></div></div>`;
+  const workstreams=projectWorkstreams(p);
+  return `<div class="section-row" style="margin-top:0"><div><h2>All project tasks</h2><p>${tasks.length} tasks across ${workstreams.length} workstreams.</p></div><div class="filters"><select class="select" id="projectWorkstreamFilter" aria-label="Filter tasks by category"><option value="">All Categories</option>${workstreams.map(w=>{const id=projectWorkstreamCategoryId(p,w);return `<option value="${escapeHtml(id)}" ${activeProjectCategoryId===id?'selected':''}>${escapeHtml(w.name)}</option>`}).join('')}</select><select class="select" id="projectStatusFilter"><option value="">All Statuses</option>${[...new Set(tasks.map(t=>t.status))].map(st=>`<option value="${escapeHtml(st)}">${escapeHtml(st)}</option>`).join('')}</select></div></div>
+    <div class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Task</th><th>Owner</th><th>Priority</th><th>Status</th><th>Progress</th><th>Due</th><th>Next Action</th></tr></thead><tbody id="projectTaskRows">${tasks.map(t=>projectTaskRow(t,projectWorkstreamCategoryId(p,t.workstream))).join('')}</tbody></table></div></div>`;
 }
-function projectTaskRow(t){const progress=Math.max(0,Math.min(100,Number(t.progress)||0));return `<tr data-task-row="${escapeHtml(t.id)}" data-workstream="${escapeHtml(t.workstream)}" data-status="${escapeHtml(t.status)}"><td><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><div class="subtle">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div></td><td>${person(t.owner)}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td><div class="progress-wrap"><div class="progress"><span style="width:${progress}%"></span></div><div class="percent">${progress}%</div></div></td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${escapeHtml(t.next)}</td></tr>`}
+function projectTaskRow(t,categoryId=String(t.categoryId||t.workstream||'')){const progress=Math.max(0,Math.min(100,Number(t.progress)||0));return `<tr data-task-row="${escapeHtml(t.id)}" data-workstream="${escapeHtml(t.workstream)}" data-category-id="${escapeHtml(categoryId)}" data-status="${escapeHtml(t.status)}"><td><button class="task-link" data-task="${escapeHtml(t.id)}">${escapeHtml(t.title)}</button><div class="subtle">${escapeHtml(t.workstream)} • ${escapeHtml(t.deliverable)}</div></td><td>${person(t.owner)}</td><td>${priorityPill(t.priority)}</td><td>${statusPill(isOverdue(t)?'Overdue':t.status)}</td><td><div class="progress-wrap"><div class="progress"><span style="width:${progress}%"></span></div><div class="percent">${progress}%</div></div></td><td>${fmtDate(t.currentDue)}${t.originalDue!==t.currentDue?`<div class="subtle">Original ${fmtDate(t.originalDue)}</div>`:''}</td><td>${escapeHtml(t.next)}</td></tr>`}
 
 function renderProjectTimeline(p,tasks){
   const sorted=[...tasks].sort((a,b)=>a.currentDue.localeCompare(b.currentDue));

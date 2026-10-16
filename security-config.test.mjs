@@ -323,3 +323,31 @@ test('Project routes persist the Project and tab in the URL hash', () => {
   router.sync('projects', null);
   assert.equal(hash, '#projects');
 });
+
+test('Project category routes use stable IDs and restore the selected category', () => {
+  const routing = require('./view-routing.js');
+  const categoryId = routing.categoryIdForProject('p123', { name: 'Data for UI' });
+  assert.notEqual(categoryId, 'Data for UI');
+  assert.equal(routing.categoryIdForProject('p123', { name: 'Data for UI' }), categoryId);
+  assert.notEqual(routing.categoryIdForProject('p456', { name: 'Data for UI' }), categoryId);
+  assert.equal(routing.categoryIdForProject('p123', { id: 'cat-existing', name: 'Data for UI' }), 'cat-existing');
+
+  const routedHash = routing.hashForProject({ projectId: 'p123', tab: 'tasks', categoryId });
+  assert.equal(routedHash, `#projects/p123/tasks?category=${encodeURIComponent(categoryId)}`);
+  assert.deepEqual(routing.parseProjectRoute(routedHash), { projectId: 'p123', tab: 'tasks', categoryId });
+  assert.deepEqual(routing.parseProjectRoute('#projects/p123/tasks'), { projectId: 'p123', tab: 'tasks' });
+
+  let hash = routedHash;
+  const location = { get hash() { return hash; } };
+  const history = { pushState: (_state, _title, next) => { hash = next; }, replaceState: (_state, _title, next) => { hash = next; } };
+  const router = routing.createViewRouter({ location, history });
+  assert.deepEqual(router.route, { projectId: 'p123', tab: 'tasks', categoryId });
+  router.sync('projects', { projectId: 'p123', tab: 'tasks', categoryId: 'category-other' });
+  assert.equal(hash, '#projects/p123/tasks?category=category-other');
+  assert.deepEqual(router.route, { projectId: 'p123', tab: 'tasks', categoryId: 'category-other' });
+  router.sync('projects', { projectId: 'p123', tab: 'tasks' });
+  assert.equal(hash, '#projects/p123/tasks');
+  assert.ok(phase13Source.includes('data-project-category-more="${escapeHtml(categoryId)}"'));
+  assert.ok(phase13Source.includes('data-category-id="${escapeHtml(categoryId)}"'));
+  assert.ok(phase13Source.includes('activeProjectCategoryId===categoryId?\'selected\':\'\''));
+});

@@ -26,17 +26,36 @@
   }
 
   function parseProjectRoute(hash) {
-    const [head, id, tab] = String(hash || '').replace(/^#/, '').trim().split('/');
+    const [path, query = ''] = String(hash || '').replace(/^#/, '').trim().split('?');
+    const [head, id, tab] = path.split('/');
     if (String(head || '').toLowerCase() !== 'projects' || !id) return null;
     try {
-      return { projectId: decodeURIComponent(id), tab: decodeURIComponent(tab || '') || 'overview' };
+      const route = { projectId: decodeURIComponent(id), tab: decodeURIComponent(tab || '') || 'overview' };
+      const params = new URLSearchParams(query);
+      const categoryId = params.get('category') || params.get('categoryId');
+      if (categoryId) route.categoryId = categoryId;
+      return route;
     } catch {
       return null;
     }
   }
 
   function hashForProject(route) {
-    return `#projects/${encodeURIComponent(route.projectId)}/${encodeURIComponent(route.tab || 'overview')}`;
+    const path = `#projects/${encodeURIComponent(route.projectId)}/${encodeURIComponent(route.tab || 'overview')}`;
+    return route.categoryId ? `${path}?category=${encodeURIComponent(route.categoryId)}` : path;
+  }
+
+  function categoryIdForProject(projectId, category) {
+    const record = category && typeof category === 'object' ? category : { name: category };
+    const explicitId = record.id || record.categoryId;
+    if (explicitId) return String(explicitId);
+    const identity = `${String(projectId || '')}\u0000${String(record.name || '').trim()}`;
+    let hash = 2166136261;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `category-${(hash >>> 0).toString(36)}`;
   }
 
   function createViewRouter({ location, history, isSystemAdmin = () => false }) {
@@ -67,7 +86,7 @@
         const view = resolveView(location.hash, isSystemAdmin());
         const route = view === 'projects' ? parseProjectRoute(location.hash) : null;
         write(view, true, route);
-        const changed = view !== currentView || (route?.projectId || null) !== (currentRoute?.projectId || null) || (route?.tab || null) !== (currentRoute?.tab || null);
+        const changed = view !== currentView || (route?.projectId || null) !== (currentRoute?.projectId || null) || (route?.tab || null) !== (currentRoute?.tab || null) || (route?.categoryId || null) !== (currentRoute?.categoryId || null);
         currentView = view;
         currentRoute = route;
         return changed ? view : null;
@@ -75,5 +94,5 @@
     };
   }
 
-  return { createViewRouter, hashForView, hashForProject, parseProjectRoute, resolveView, views: [...views] };
+  return { categoryIdForProject, createViewRouter, hashForView, hashForProject, parseProjectRoute, resolveView, views: [...views] };
 });
