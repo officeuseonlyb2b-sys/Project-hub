@@ -47,7 +47,7 @@
 
   function categoryIdForProject(projectId, category) {
     const record = category && typeof category === 'object' ? category : { name: category };
-    const explicitId = record.id || record.categoryId;
+    const explicitId = record.id || record.categoryId || record.workstreamId || record.firebaseKey || record.key;
     if (explicitId) return String(explicitId);
     const identity = `${String(projectId || '')}\u0000${String(record.name || '').trim()}`;
     let hash = 2166136261;

@@ -16,7 +16,14 @@ const seed = {
   performanceSnapshots: []
 };
 
-const projectWorkstreams = project => Array.isArray(project?.workstreams) ? project.workstreams : [];
+const projectWorkstreams = project => {
+  const hasRecords=value=>Array.isArray(value)?value.some(item=>item&&typeof item==='object'):!!(value&&typeof value==='object'&&Object.values(value).some(item=>item&&typeof item==='object'));
+  const collection = hasRecords(project?.workstreams) ? 'workstreams' : hasRecords(project?.categories) ? 'categories' : project?.workstreams != null ? 'workstreams' : 'categories';
+  const stored = project?.[collection];
+  if (Array.isArray(stored)) return stored.filter(item=>item&&typeof item==='object').map((item,index)=>Object.assign(Object.create(Object.getPrototypeOf(item)),item,{firebaseKey:String(index),firebaseCollection:collection}));
+  if (stored&&typeof stored==='object') return Object.entries(stored).filter(([,item])=>item&&typeof item==='object').map(([key,item])=>Object.assign(Object.create(Object.getPrototypeOf(item)),item,{firebaseKey:key,firebaseCollection:collection}));
+  return [];
+};
 function withSafeProjectWorkstreams(project){
   if(!project || typeof project !== 'object') return project;
   return new Proxy(project,{
@@ -65,8 +72,9 @@ const task = id => state.tasks.find(t=>t.id===id);
 function projectWorkstreamCategoryId(projectRecord, workstream){
   const name=typeof workstream==='string'?workstream:workstream?.name||'';
   const category=typeof workstream==='object'&&workstream?workstream:projectWorkstreams(projectRecord).find(item=>item.name===name);
-  const existingTaskCategoryId=state.tasks.find(item=>item.project===projectRecord?.id&&item.workstream===name&&item.categoryId&&item.categoryId!==name)?.categoryId;
-  return window.executionHubViewRouting?.categoryIdForProject(projectRecord?.id,{...category,name,id:category?.id||category?.categoryId||existingTaskCategoryId})||String(category?.id||category?.categoryId||existingTaskCategoryId||`${projectRecord?.id}:${name}`);
+  const explicitId=category?.id||category?.categoryId||category?.legacyId||category?.workstreamId||category?.firebaseKey||category?.key;
+  const stableId=explicitId;
+  return window.executionHubViewRouting?.categoryIdForProject(projectRecord?.id,{...category,name,id:stableId})||String(stableId||`${projectRecord?.id}:${name}`);
 }
 const save = () => {
   state.users.forEach(account => {

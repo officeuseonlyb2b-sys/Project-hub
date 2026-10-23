@@ -299,6 +299,30 @@ function recordsFrom(value) {
   return [];
 }
 
+// Resolve a project category without treating its display name as identity.
+// `key` is the real RTDB child key (or array index) and `collection` is the
+// actual legacy/current container in the canonical project record.
+function resolveProjectCategory(project, categoryId) {
+  const wanted = String(categoryId ?? '');
+  if (!project || !wanted) return null;
+  for (const collection of ['workstreams', 'categories']) {
+    const stored = project[collection];
+    const entries = Array.isArray(stored)
+      ? stored.map((category, index) => [String(index), category])
+      : stored && typeof stored === 'object' ? Object.entries(stored) : [];
+    for (const [key, category] of entries) {
+      if (!category || typeof category !== 'object') continue;
+      const identities = [category.id, category.categoryId, category.legacyId, category.workstreamId];
+      if (identities.some(value => value != null && String(value) === wanted) || String(key) === wanted) {
+        return { collection, key, category };
+      }
+    }
+  }
+  return null;
+}
+
+if (typeof window !== 'undefined') window.resolveProjectCategory = resolveProjectCategory;
+
 function projectMemberIds(project) {
   const team = Array.isArray(project?.team) ? project.team : Object.values(project?.team || {});
   return [...new Set([project?.projectLead, ...team].filter(id => typeof id === 'string' && id))];
@@ -1463,6 +1487,7 @@ async function loadApplication() {
   await loadClassicScript('phase18.js');
   await loadClassicScript('daily-work-model.js');
   await loadClassicScript('phase20.js');
+  await loadClassicScript('phase21.js');
   appLoaded = true;
   window.executionHubModulesReady = true;
 }
@@ -2141,6 +2166,81 @@ window.firebaseHub = {
       if (savedActivity) canonicalEventKeys.add(`a:${taskId}/${savedActivity.id}`);
     }
     return { task: savedTask, activity: savedActivity };
+  },
+  async updateProjectCategory(projectId, categoryId, patch) {
+    const actorUid = auth.currentUser?.uid || '';
+    const appUserId = employeeProfile?.appUserId || '';
+    if (!actorUid || !appDataWritesEnabled || !projectId || !categoryId) throw new Error('Category data is incomplete or the session is not ready.');
+    const projectPath = `${sharedProjectsPath}/${databaseRecordKey(projectId)}`;
+    const beforeSnapshot = await get(ref(database, projectPath));
+    const currentProject = beforeSnapshot.exists() ? beforeSnapshot.val() : null;
+    if (!currentProject?.id) throw new Error(`Category project was not found at ${projectPath}.`);
+    const resolved = resolveProjectCategory(currentProject, categoryId);
+    if (!resolved) throw new Error(`The category does not exist in the canonical project ${projectPath} for categoryId ${categoryId}. Refresh and try again.`);
+    const { collection: categoryCollection, key: categoryKey, category: current } = resolved;
+    const rawCategories = currentProject[categoryCollection];
+    const categoryEntries = Array.isArray(rawCategories) ? rawCategories.map((category, index) => [String(index), category]) : Object.entries(rawCategories || {});
+    const projectTasks = recordsFrom(lastApplicationState?.tasks).filter(task => task.project === projectId);
+    const index = categoryEntries.findIndex(([key]) => key === categoryKey);
+    const categoryPath = `${projectPath}/${categoryCollection}/${databaseRecordKey(categoryKey)}`;
+    console.info('Project category edit target', { projectId: String(projectId), categoryId: String(categoryId), categoryName: String(current.name || ''), firebasePath: categoryPath });
+    const managesProject = isSystemAdmin() || currentProject.projectLead === appUserId;
+    const ownsCategory = (current.owner || current.ownerAppUserId) === appUserId;
+    if (!managesProject && !ownsCategory) throw new Error('You do not have permission to edit this category.');
+    const allowed = managesProject ? ['name', 'owner', 'ownerAppUserId', 'status'] : ['name', 'status'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    if (Object.hasOwn(safePatch, 'owner')) {
+      if (Object.hasOwn(current, 'ownerAppUserId') && !Object.hasOwn(current, 'owner')) safePatch.ownerAppUserId = safePatch.owner;
+      if (!Object.hasOwn(current, 'owner')) delete safePatch.owner;
+    }
+    const nextName = String(safePatch.name ?? current.name ?? '').trim();
+    if (!nextName) throw new Error('Category name is required.');
+    if (categoryEntries.some(([, category], categoryIndex) => categoryIndex !== index && String(category.name || '').trim().toLowerCase() === nextName.toLowerCase())) throw new Error('A category with that name already exists in this project.');
+    const stableId = String(categoryId);
+    const updatedCategory = { ...current, ...safePatch, name: nextName };
+    const updates = {};
+    Object.entries(safePatch).forEach(([key, value]) => { updates[`${categoryPath}/${key}`] = value == null ? null : value; });
+    updates[`${categoryPath}/name`] = nextName;
+    const linkedTasks = projectTasks.filter(task => String(task.categoryId || '') === stableId || task.workstream === current.name);
+    linkedTasks.forEach(task => {
+      const linkedTaskPath = `${sharedTasksPath}/${databaseRecordKey(task.id)}`;
+      updates[`${linkedTaskPath}/workstream`] = nextName;
+      updates[`${linkedTaskPath}/categoryId`] = stableId;
+    });
+    await update(ref(database), updates);
+    const [projectReadBack, ...taskReadBack] = await Promise.all([get(ref(database, projectPath)), ...linkedTasks.map(task => get(ref(database, `${sharedTasksPath}/${databaseRecordKey(task.id)}`)))]);
+    const savedProject = projectReadBack.exists() ? projectReadBack.val() : null;
+    const savedRawCategories = savedProject?.[categoryCollection] || [];
+    const savedCategory = Array.isArray(savedRawCategories) ? savedRawCategories[Number(categoryKey)] : savedRawCategories[categoryKey];
+    if (!savedCategory || savedCategory.name !== nextName || Object.entries(safePatch).some(([key, value]) => savedCategory[key] !== value)) throw new Error(`Category read-back failed at ${categoryPath}.`);
+    const savedTasks = taskReadBack.map(snapshot => snapshot.exists() ? snapshot.val() : null);
+    if (savedTasks.some(record => !record || record.workstream !== nextName || record.categoryId !== stableId)) throw new Error('Category task-link read-back failed.');
+    canonicalProjectJson.set(String(projectId), canonicalJson(savedProject));
+    savedTasks.forEach(record => canonicalTaskJson.set(String(record.id), canonicalJson(record)));
+    if (lastApplicationState) {
+      lastApplicationState.projects = recordsFrom(lastApplicationState.projects).map(record => record.id === projectId ? savedProject : record);
+      lastApplicationState.tasks = recordsFrom(lastApplicationState.tasks).map(record => savedTasks.find(saved => saved.id === record.id) || record);
+    }
+    return { project: savedProject, category: savedCategory, categoryId: stableId, categoryPath, tasks: savedTasks };
+  },
+  async updateProjectTask(taskId, patch) {
+    const actorUid = auth.currentUser?.uid || '';
+    if (!actorUid || !appDataWritesEnabled || !taskId) throw new Error('Task data is incomplete or the session is not ready.');
+    const taskPath = `${sharedTasksPath}/${databaseRecordKey(taskId)}`;
+    const beforeSnapshot = await get(ref(database, taskPath));
+    const current = beforeSnapshot.exists() ? beforeSnapshot.val() : null;
+    if (!current?.id || current.contextType === 'regular_work') throw new Error(`Project task was not found at ${taskPath}.`);
+    const allowed = ['title', 'workstream', 'categoryId', 'owner', 'priority', 'currentDue', 'next', 'description', 'status', 'updatedAt', 'updatedByUid'];
+    const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)));
+    if ('title' in safePatch && !String(safePatch.title || '').trim()) throw new Error('Task title is required.');
+    const updates = Object.fromEntries(Object.entries(safePatch).map(([key, value]) => [`${taskPath}/${key}`, value == null ? null : value]));
+    await update(ref(database), updates);
+    const readBack = await get(ref(database, taskPath));
+    const savedTask = readBack.exists() ? readBack.val() : null;
+    if (!savedTask || savedTask.id !== taskId || Object.entries(safePatch).some(([key, value]) => value == null ? savedTask[key] != null : savedTask[key] !== value)) throw new Error(`Task read-back failed at ${taskPath}.`);
+    canonicalTaskJson.set(String(taskId), canonicalJson(savedTask));
+    if (lastApplicationState) lastApplicationState.tasks = recordsFrom(lastApplicationState.tasks).map(record => record.id === taskId ? savedTask : record);
+    return savedTask;
   },
   async saveRegularWorkComment(comment, activity) {
     const actorUid = auth.currentUser?.uid;
